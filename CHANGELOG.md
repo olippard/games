@@ -1,5 +1,64 @@
 # Utility Simulator release notes
 
+## Version 3
+
+- Added ten randomly generated regions of varying size, a clickable map, and
+  nine independent utilities with full asset, debt, cash, and operating models.
+- Use the same random 1,000–10,000 MW starting-size distribution for the player
+  and competitors. The player can start anywhere in the ranking; map area no
+  longer gives rivals a separate size advantage. Existing saved sizes remain.
+- Added competitor comparisons and market-cap rankings in Financial. Regional
+  utilities invest, finance projects, request rate relief, and reprice monthly
+  as demand, inflation, and economic conditions change.
+- Competitors retire uneconomic fossil plants as carbon/fuel costs rise,
+  compare replacement technologies, and use imports during construction.
+  They anticipate plant retirements and reduce unaffordable dividends. New
+  construction borrowing must pass leverage, interest-coverage, and operating-
+  savings checks to avoid debt-fueled overbuilding.
+- Keep competitor cash nonnegative with recorded borrowing for actual
+  shortfalls. Ordinary loans come first; a competitor-only continuity facility
+  covers essential bills beyond normal credit limits. Its interest-bearing
+  debt appears in comparisons and transfers in acquisitions; it cannot fund
+  discretionary construction or expand the human player's borrowing limit.
+- Add physical service limits: 35 years for solar/wind, 50 for coal/gas,
+  100 for nuclear/hydro, and 20 for batteries. Automatically retire expired
+  units with normal disposal accounting, separately from depreciation lives.
+  Show remaining life, advance warnings, and forecast capacity reductions.
+- Added premium-priced acquisitions: at least 40% over market cap and 15% over
+  book equity, plus 2% closing costs. Purchases transfer plants, batteries,
+  construction, cash, debt, customers, and purchase contracts; acquired company
+  shares are canceled and its assets consolidate into the player's utility.
+- Added acquisition goodwill and net acquisition spending to current and
+  historical financial statements. Preserved original plant depreciation and
+  bond maturities, and kept prior accounting periods immutable.
+- Added dedicated ten-year acquisition financing outside recessions, capped
+  by 50% of closing cost, 20% of combined net plant, interest coverage of at
+  least 2×, and combined net debt of at most 6× EBITDA. It can only fund closing
+  and does not consume or replenish the ordinary monthly credit allowance.
+- Replaced the predictable sine-wave business cycle with uncertain transitions
+  and shocks, including rare deflationary crises. Long-term yields retain
+  recency bias through a slowly declining rate-memory anchor.
+- Halved ordinary borrowing availability during recessions and disabled new
+  dedicated acquisition borrowing until the recession ends. Added explicit
+  expansion/recession stock-valuation adjustments.
+- Removed power-selling controls and export revenue, including automatic
+  surplus sales. Imports still work; surplus is curtailed after charging storage.
+- Stopped automatic inflation increases to retail tariffs. Manual requests
+  can qualify on recurring after-interest margins below 12%, not only losses.
+  Retirement write-offs do not justify rate relief or worsen credit leverage;
+  actual cash shortages and operating deterioration still matter.
+- Reduced new-game inherited capacity to just below the seasonal demand peak.
+  Doubled all new plant and battery construction costs, including the mature
+  solar/wind learning-curve targets. Existing historical costs remain fixed.
+- Added sequential schema-1/2 to schema-3 save migrations, including an original
+  version 2 fixture. Maps, competitors, acquisitions, economic memory, plant
+  service limits, and continuity debt persist without rerolling the saved RNG.
+  Legacy negative competitor cash is refinanced with explicit debt entries;
+  closed statements, plant ages, and historical costs remain unchanged.
+- Added automated coverage for plant shutdown boundaries, carbon-driven
+  replacement, cash-flow reconciliation, refinancing, randomized sizes,
+  acquisition transfers, and deterministic continued play after save/load.
+
 ## Version 2
 
 Version 2 adds persistent games, calendar financial reporting, and shareholder

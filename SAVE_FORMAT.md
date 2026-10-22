@@ -1,7 +1,7 @@
 # Gridline save format and compatibility
 
-Version 2 saves use UTF-8 JSON with format identifier `gridline-utility-save`
-and schema version `1`. The gameplay version and schema version are separate:
+Version 3 saves use UTF-8 JSON with format identifier `gridline-utility-save`
+and schema version `3`. The gameplay version and schema version are separate:
 a gameplay release need not change the schema unless compatibility changes.
 
 ## Contents
@@ -12,11 +12,17 @@ all instance fields, and references between model objects. References preserve
 shared objects such as the economy used by the player, regulator, and calendar.
 
 The complete session includes plants and their individual cost/depreciation
-records, battery energy and degradation, ongoing construction, debt and
+records and per-unit physical service limits, battery energy and degradation, ongoing construction, debt and
 maturities, borrowing allowances, pending and active power contracts, cash-flow
 ledgers, equity trading limits, shareholder state, credit memory, economic and
 carbon-policy state, immutable monthly statements, and the remaining game
-horizon. GUI saves also include graph history and the event log. Window
+horizon. It also includes all ten regions, map polygons, regional ownership,
+competitor account objects and investment preferences, acquisition goodwill
+and cash-flow ledgers, transferred customer territories, credit retirement
+adjustments, business-cycle regimes, deflation duration, and the long-rate
+memory anchor. Competitor continuity loans carry a `regional_liquidity` purpose
+and otherwise use the same saved principal, coupon, and maturity fields as
+other bonds. GUI saves also include graph history and the event log. Window
 positions and open dialogs are not simulation state and are not saved.
 
 The random-generator state is restored only after the save validates. With
@@ -46,7 +52,45 @@ sequence. Future releases that change simulation rules may change outcomes.
    partially completed projects, battery charge, share-trading allowances,
    and shareholder/credit history.
 
-Schema 1 is the first save format, so no older migrations are required yet.
+## Upgrading original version 2 saves
+
+`MIGRATIONS[1]` upgrades the first save format to schema 2. It keeps existing
+asset costs, bond terms, balances, statement history, and random state intact.
+The current inflation-adjusted tariff is converted to a fixed nominal tariff.
+Existing export contracts are canceled; historical sales revenue is preserved.
+Historical goodwill and acquisition cash-flow lines are initialized to zero.
+
+The loader generates the nine new utilities and regional map from a separate,
+deterministic seed, restoring the saved simulation random state afterwards.
+The player's existing region, fleet, and financial history are not regenerated.
+Competitor opening histories are labeled estimates. New-games-only changes,
+such as a smaller inherited fleet, are not applied to existing playthroughs.
+The doubled construction prices apply to new orders, not previously paid
+projects or the historical ledger.
+
+The original schema-1 fixture in `tests/fixtures/schema1_save.json` is a
+generated test game, not a user's playthrough. Migration and acquired-world
+continuation are covered by `test_utility_regions.py`.
+
+## Upgrading regional saves to schema 3
+
+`MIGRATIONS[2]` adds `operating_life_months` to each plant without changing its
+age, original cost, accumulated depreciation, or historical statements. Service
+limits are 35 years for solar/wind, 50 for coal/gas, 100 for nuclear/hydro, and
+20 for batteries. Units already past their limit retire before dispatch on the
+next monthly turn, with disposal entries recorded in that open period.
+
+After the decoded accounts validate, old negative competitor cash is refinanced
+using ordinary borrowing and, if needed, a continuity loan. The resulting cash
+and debt changes enter the open month's financing ledger; old closed reports
+are not rewritten and the saved random state is unchanged. Existing map areas,
+utility sizes, and ownership are preserved. Current-format saves with negative
+competitor cash or invalid service limits are rejected.
+
+`test_utility_lifecycle.py` covers schema-2 migration, financing reconciliation,
+physical retirements, and deterministic continuation. Schema-1 saves run both
+migrations in order.
+
 Unsupported newer schemas are rejected with an explanation; extensibility
 does not mean an older game can safely interpret every future mechanic.
 

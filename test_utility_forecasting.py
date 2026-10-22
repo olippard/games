@@ -33,10 +33,11 @@ class ForecastingTests(unittest.TestCase):
         self.assertEqual((rows[0]['month'], rows[0]['year']), (1, 4))
         self.assertEqual((rows[-1]['month'], rows[-1]['year']), (12, 5))
         january = (self.player.base_territory_mw * self.state.demand_index
-                   * (1 + utility.MONTHLY_DEMAND_GROWTH) * 0.65)
+                   * (1 + utility.MONTHLY_DEMAND_GROWTH + .008 * self.session.economy.sentiment / 12) * 0.65)
         self.assertAlmostEqual(rows[0]['expected'], january)
         self.assertGreater(rows[6]['expected'], rows[0]['expected'])
-        self.assertAlmostEqual(rows[12]['expected'] / rows[0]['expected'], 1.02)
+        self.assertAlmostEqual(rows[12]['expected'] / rows[0]['expected'],
+                               (1 + utility.MONTHLY_DEMAND_GROWTH + .008 * self.session.economy.sentiment / 12) ** 12)
         for row in rows:
             self.assertAlmostEqual(row['low'], row['expected'] * 0.90)
             self.assertAlmostEqual(row['high'], row['expected'] * 1.10)
@@ -75,13 +76,13 @@ class ForecastingTests(unittest.TestCase):
             {'type': 'nuclear', 'turns_remaining': 72},
         ]
         self.player.wholesale_commitment_mw = 200
-        self.player.pending_wholesale_commitment_mw = -100
+        self.player.pending_wholesale_commitment_mw = 100
         rows = self.grid.forecast_demand(self.player, self.state, months=3)
         gas = utility.PLANT_NAMEPLATE_CAPACITY['natural_gas'] * utility.CAPACITY_CREDIT['natural_gas']
         battery = utility.PLANT_NAMEPLATE_CAPACITY['battery'] * utility.CAPACITY_CREDIT['battery']
-        self.assertAlmostEqual(rows[0]['firm_supply'], firm - 100)
-        self.assertAlmostEqual(rows[1]['firm_supply'], firm - 100 + gas)
-        self.assertAlmostEqual(rows[2]['firm_supply'], firm - 100 + gas + battery)
+        self.assertAlmostEqual(rows[0]['firm_supply'], firm + 100)
+        self.assertAlmostEqual(rows[1]['firm_supply'], firm + 100 + gas)
+        self.assertAlmostEqual(rows[2]['firm_supply'], firm + 100 + gas + battery)
         self.player.pending_wholesale_commitment_mw = 0  # cancellation, not no pending edit
         self.assertEqual(self.grid.forecast_demand(self.player, self.state)[0]['firm_supply'], firm)
 
@@ -172,7 +173,7 @@ class ForecastingTests(unittest.TestCase):
                 prices.append(p.stock_price)
         self.assertEqual(prices, sorted(prices))
         self.assertAlmostEqual(prices[-1] - prices[-2],
-                               0.70 * p.valuation_pe * utility.STOCK_SMOOTHING)
+                               0.70 * p.valuation_pe * utility.STOCK_SMOOTHING * self.session.economy.equity_cycle_factor)
         self.assertAlmostEqual(utility.BOOK_VALUE_WEIGHT + utility.EARNINGS_WEIGHT
                                + utility.DIVIDEND_WEIGHT, 1)
 

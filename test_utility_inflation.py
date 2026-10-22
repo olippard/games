@@ -28,7 +28,7 @@ class InflationTests(unittest.TestCase):
     def test_opening_prices_have_no_premature_month_of_inflation(self):
         self.assertEqual(self.economy.price_index, 1)
         self.assertEqual(self.economy.monthly_inflation_factor, 1)
-        self.assertEqual(self.player.construction_cost('nuclear'), 9_000_000_000)
+        self.assertEqual(self.player.construction_cost('nuclear'), 18_000_000_000)
         self.assertEqual(self.session.regulator.current_retail_price, 150)
         self.assertEqual(self.state.natural_gas_price, 45)
         self.assertIs(self.player.economy, self.economy)
@@ -40,7 +40,7 @@ class InflationTests(unittest.TestCase):
         for _ in range(12):
             self.economy.advance_price_level()
         self.assertAlmostEqual(self.economy.price_index, 1.12)
-        self.assertAlmostEqual(self.player.construction_cost('nuclear'), 10_080_000_000,
+        self.assertAlmostEqual(self.player.construction_cost('nuclear'), 20_160_000_000,
                                delta=0.01)
 
     def test_changing_rates_preserve_the_actual_inflation_path(self):
@@ -61,8 +61,8 @@ class InflationTests(unittest.TestCase):
             self.economy.advance_price_level()
         self.assertAlmostEqual(self.economy.price_index, 0.99)
         self.assertAlmostEqual(self.player.construction_cost('solar'),
-                               600_000_000 * .99 * self.economy.technology_cost_factor('solar'), delta=0.01)
-        self.assertAlmostEqual(self.session.regulator.current_retail_price, 148.5)
+                           1_200_000_000 * .99 * self.economy.technology_cost_factor('solar'), delta=0.01)
+        self.assertAlmostEqual(self.session.regulator.current_retail_price, 150)
 
     def test_month_close_advances_prices_once_using_displayed_annual_rate(self):
         before = self.economy.price_index
@@ -105,7 +105,7 @@ class InflationTests(unittest.TestCase):
                 for key in ('fuel_om_power', 'carbon', 'cash_cost'):
                     self.assertAlmostEqual(row[key], before[row['source']][key] * 1.3, delta=0.01)
 
-    def test_wholesale_buys_sales_and_retail_revenue_all_follow_index(self):
+    def test_wholesale_costs_follow_index_but_sales_are_zero_and_retail_fixed(self):
         self.grid.contract_imports_mw = 100
         self.grid.contract_exports_mw = 200
         self.grid.spot_imports_mw = 50
@@ -119,19 +119,22 @@ class InflationTests(unittest.TestCase):
         self.economy.price_index = 1.4
         self.assertAlmostEqual(utility.wholesale_market_price(self.economy), market * 1.4)
         f.calculate_revenue(self.grid, self.session.regulator, self.economy)
-        for key in keys:
+        for key in keys[:-1]:
             self.assertAlmostEqual(getattr(f, key), before[key] * 1.4, delta=0.01)
+        self.assertEqual(f.monthly_electric_revenue, before['monthly_electric_revenue'])
+        self.assertEqual(f.contract_sales_revenue + f.spot_sales_revenue, 0)
 
-    def test_rate_case_increase_is_preserved_above_inflation(self):
+    def test_manual_rate_increase_stays_fixed_despite_inflation(self):
         regulator = self.session.regulator
         self.economy.price_index = 1.2
-        self.assertEqual(regulator.current_retail_price, 180)
+        self.assertEqual(regulator.current_retail_price, 150)
+        self.financials.operating_income = self.financials.interest_expense + 1
         with patch('utility.random.random', return_value=0):
             self.assertTrue(regulator.request_increase(
                 self.player, self.financials, self.economy, self.state.turn, 0.10))
-        self.assertAlmostEqual(regulator.current_retail_price, 198)
+        self.assertAlmostEqual(regulator.current_retail_price, 165)
         self.economy.price_index = 1.32
-        self.assertAlmostEqual(regulator.current_retail_price, 150 * 1.10 * 1.32)
+        self.assertAlmostEqual(regulator.current_retail_price, 165)
 
     def test_gas_mean_reversion_and_price_caps_are_in_real_dollars(self):
         self.economy.price_index = 1.4
@@ -169,28 +172,28 @@ class InflationTests(unittest.TestCase):
                                     p.construction_work_in_progress(), p.annual_dividend_per_share,
                                     tuple((b.principal, b.annual_rate, b.months_remaining) for b in p.bonds)))
         p.update_constructions()
-        self.assertEqual(p.ongoing_constructions[0]['total_cost'], 600_000_000)
+        self.assertEqual(p.ongoing_constructions[0]['total_cost'], 1_200_000_000)
 
     def test_overrun_work_uses_current_prices_but_old_payments_stay_fixed(self):
         p = self.player
-        p.cash = 20_000_000_000
+        p.cash = 40_000_000_000
         self.economy.price_index = 1.2
         p.start_construction('nuclear')
         project = p.ongoing_constructions[0]
-        self.assertEqual(project['initial_cost'], 10_800_000_000)
+        self.assertEqual(project['initial_cost'], 21_600_000_000)
         self.economy.price_index = 1.5
         cash = p.cash
         with patch('utility.random.random', return_value=0), \
                 patch('utility.random.uniform', return_value=0.04):
             p.update_constructions()
-        self.assertAlmostEqual(cash - p.cash, 540_000_000, delta=0.01)
-        self.assertEqual(project['initial_cost'], 10_800_000_000)
-        self.assertAlmostEqual(project['total_cost'], 11_340_000_000, delta=0.01)
+        self.assertAlmostEqual(cash - p.cash, 1_080_000_000, delta=0.01)
+        self.assertEqual(project['initial_cost'], 21_600_000_000)
+        self.assertAlmostEqual(project['total_cost'], 22_680_000_000, delta=0.01)
         project['turns_remaining'] = 1
         p.update_constructions()
         asset = p.plant_assets[-1]
-        self.assertAlmostEqual(asset.original_cost, 11_340_000_000, delta=0.01)
-        self.assertAlmostEqual(asset.inflation_adjusted_cost(1.5), 14_040_000_000, delta=0.01)
+        self.assertAlmostEqual(asset.original_cost, 22_680_000_000, delta=0.01)
+        self.assertAlmostEqual(asset.inflation_adjusted_cost(1.5), 28_080_000_000, delta=0.01)
 
     def test_retirement_inflates_salvage_and_teardown_not_removed_book_value(self):
         p = self.player
@@ -207,13 +210,13 @@ class InflationTests(unittest.TestCase):
     def test_new_asset_salvage_does_not_inflate_its_purchase_price_twice(self):
         p = self.player
         self.economy.price_index = 1.5
-        p.cash = 1_000_000_000
+        p.cash = 3_000_000_000
         p.start_construction('solar')
         p.ongoing_constructions[0]['turns_remaining'] = 1
         p.update_constructions()
         cash = p.cash
         p.decommission_plant('solar')
-        self.assertAlmostEqual(p.cash - cash, 900_000_000 * 0.15 - 200_000 * 1.5, delta=0.01)
+        self.assertAlmostEqual(p.cash - cash, 1_800_000_000 * 0.15 - 200_000 * 1.5, delta=0.01)
         self.economy.price_index = 1.2
         p.batteries.append({})
         p._add_plant_asset('battery', 180_000_000)
@@ -236,7 +239,7 @@ class InflationTests(unittest.TestCase):
 
     def test_cli_uses_the_same_economy_for_every_price(self):
         calls = []
-        def actions(player, economy, regulator, financials, credit, turn, state):
+        def actions(player, economy, regulator, financials, credit, turn, state, session=None):
             calls.append(turn)
             self.assertIs(player.economy, economy)
             self.assertIs(state.economy, economy)
