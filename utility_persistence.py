@@ -13,9 +13,65 @@ import tempfile
 from datetime import datetime, timezone
 
 FORMAT = 'gridline-utility-save'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 MAX_SAVE_BYTES = 64 * 1024 * 1024
-MIGRATIONS = {}  # old version -> function returning the next-version document
+
+
+def migrate_v1(document):
+    """Keep historical values; introduce regional state and freeze current tariffs."""
+    records = document['graph']['objects']
+    for record in records:
+        fields = record['fields']
+        kind = record['type']
+        if kind == 'Economy':
+            fields.setdefault('regime', 'recession' if fields.get('sentiment', 0) < -.4 else 'expansion')
+            fields.setdefault('regime_months', 0)
+            fields.setdefault('deflation_months', 0)
+            fields.setdefault('long_rate_anchor', fields['interest_rate'])
+            fields.setdefault('last_cycle_event', None)
+        elif kind == 'RateRegulator':
+            reference = fields.get('economy')
+            index = records[reference['$ref']]['fields']['price_index'] if reference else 1.0
+            fields.setdefault('_nominal_retail_price', fields.get('_real_retail_price', 150) * index)
+        elif kind == 'PlayerState':
+            for key in ('goodwill', 'retirement_credit_adjustment', 'acquisition_spending_since_close',
+                        'acquisition_debt_issued_since_close'):
+                fields.setdefault(key, 0.0)
+            fields.setdefault('service_territories', [])
+            fields.setdefault('acquired_ebitda_support', [])
+            fields['wholesale_commitment_mw'] = max(0, fields['wholesale_commitment_mw'])
+            pending = fields['pending_wholesale_commitment_mw']
+            if pending is not None:
+                fields['pending_wholesale_commitment_mw'] = max(0, pending)
+        elif kind == 'PowerGrid':
+            fields['contract_exports_mw'] = fields['spot_exports_mw'] = 0.0
+        elif kind == 'Financials':
+            fields.setdefault('acquisition_spending', 0.0)
+            for month in fields['monthly_history']:
+                month['balance'].setdefault('goodwill', 0.0)
+                month['cash_flow'].setdefault('acquisition_spending', 0.0)
+        elif kind == 'UtilityGameSession':
+            fields.setdefault('regions', [])
+            fields['_needs_regions'] = True
+    return document
+
+
+def migrate_v2(document):
+    """Preserve ages and book costs; add explicit physical service limits."""
+    lives = {'coal': 50, 'natural_gas': 50, 'nuclear': 100,
+             'solar': 35, 'wind': 35, 'hydro': 100, 'battery': 20}
+    for record in document['graph']['objects']:
+        fields = record['fields']
+        if record['type'] == 'PlantAsset':
+            fields.setdefault('operating_life_months', lives[fields['plant_type']] * 12)
+        elif record['type'] == 'RegionalUtility':
+            # Normal loan entries are posted after the decoded accounts validate;
+            # old closed statements and the random sequence remain untouched.
+            fields['_needs_liquidity_repair'] = True
+    return document
+
+
+MIGRATIONS = {1: migrate_v1, 2: migrate_v2}  # old version -> next-version document
 
 
 class SaveError(ValueError):

@@ -14,7 +14,7 @@ except ImportError:  # The simulation and CLI can still run without Tk.
     tk = None
     filedialog = messagebox = simpledialog = ttk = None
 
-GAME_VERSION = '2.0'
+GAME_VERSION = '3.0'
 
 # --- Game Constants ---
 
@@ -74,16 +74,16 @@ BATTERY_ROUND_TRIP_EFFICIENCY = 0.90  # 90% of stored energy is recoverable
 BATTERY_MIN_CAPACITY_FRACTION = 0.20  # battery is "dead" below 20% of original max
 
 # Construction Costs (opening dollars; future quotes follow cumulative inflation)
-COAL_CONSTRUCTION_COST = 3_000_000_000       # ~$3B for 600 MW
-NATURAL_GAS_CONSTRUCTION_COST = 1_000_000_000 # ~$1B for 500 MW CCGT
-NUCLEAR_CONSTRUCTION_COST = 9_000_000_000     # $7,500/kW for a 1,200 MW unit
-SOLAR_CONSTRUCTION_COST = 600_000_000         # early technology; learning reduces real cost
-WIND_CONSTRUCTION_COST = 450_000_000
-RENEWABLE_MATURE_COST = {'solar': 330_000_000, 'wind': 275_000_000}
+COAL_CONSTRUCTION_COST = 6_000_000_000
+NATURAL_GAS_CONSTRUCTION_COST = 2_000_000_000
+NUCLEAR_CONSTRUCTION_COST = 18_000_000_000
+SOLAR_CONSTRUCTION_COST = 1_200_000_000
+WIND_CONSTRUCTION_COST = 900_000_000
+RENEWABLE_MATURE_COST = {'solar': 660_000_000, 'wind': 550_000_000}
 RENEWABLE_LEARNING_MONTHS = 120
-HYDRO_BASE_CONSTRUCTION_COST = 650_000_000    # ~$3,250/kW at the best remaining site
+HYDRO_BASE_CONSTRUCTION_COST = 1_300_000_000
 HYDRO_SITE_COST_ESCALATION = 0.18             # progressively less economic rivers
-BATTERY_CONSTRUCTION_COST = 150_000_000       # ~$1,500/kW for 100 MW / 400 MWh
+BATTERY_CONSTRUCTION_COST = 300_000_000
 
 DECOMMISSION_INFO = {
     'coal':        (0.10, 1_000_000),
@@ -145,6 +145,17 @@ ASSET_USEFUL_LIFE_YEARS = {
     'hydro': 80,
     'battery': 15,
 }
+# Physical service limits are separate from the historical depreciation ledger.
+PLANT_OPERATING_LIFE_YEARS = {
+    'coal': 50, 'natural_gas': 50, 'nuclear': 100,
+    'solar': 35, 'wind': 35, 'hydro': 100, 'battery': 20,
+}
+PLANT_CONSTRUCTION_MONTHS = {
+    'coal': COAL_CONSTRUCTION_TIME, 'natural_gas': NATURAL_GAS_CONSTRUCTION_TIME,
+    'nuclear': NUCLEAR_CONSTRUCTION_TIME, 'solar': SOLAR_CONSTRUCTION_TIME,
+    'wind': WIND_CONSTRUCTION_TIME, 'hydro': HYDRO_CONSTRUCTION_TIME,
+    'battery': BATTERY_CONSTRUCTION_TIME,
+}
 OPENING_PLANT_AGE_FRACTION_RANGE = (0.20, 0.65)
 
 # Add near the equity constants
@@ -159,6 +170,10 @@ STARTING_DEBT_MULTIPLIER = 2.0
 LEGACY_BOND_RATE_RANGE = (0.03, 0.07)  # historical rates the old bonds were issued at
 BOND_BUYBACK_TRANSACTION_COST = 0.005  # dealer spread / execution cost
 MONTHLY_BORROWING_ASSET_FRACTION = 0.10  # shared by bonds and emergency loans
+RECESSION_CREDIT_MULTIPLIER = 0.50
+TAKEOVER_PREMIUM = 0.40
+ACQUISITION_FEE = 0.02
+ACQUISITION_FINANCE_FRACTION = 0.50
 
 # Credit trouble should arrive quickly but take much longer to repair. These
 # are monthly weights applied to the newest financial result.
@@ -195,8 +210,40 @@ def wholesale_market_price(economy):
 def power_contract_description(net_import_mw):
     if net_import_mw == 0:
         return 'None'
-    direction = 'Buy' if net_import_mw > 0 else 'Sell'
-    return f'{direction} {abs(net_import_mw):,.0f} MW'
+    return f'Buy {max(0, net_import_mw):,.0f} MW'
+
+
+def regional_seasonality(climate, month):
+    summer = math.cos(2 * math.pi * (month - 1) / 12 - math.pi)
+    if climate == 'hot':
+        return 1 + .35 * summer
+    if climate == 'cold':
+        return 1 - .35 * summer
+    return 1 + .20 * abs(summer)
+
+
+def region_polygons(sites):
+    """Clip ten Voronoi regions to a unit square; no graphics dependency."""
+    polygons = []
+    for x, y in sites:
+        polygon = [(0., 0.), (1., 0.), (1., 1.), (0., 1.)]
+        for other_x, other_y in sites:
+            if (x, y) == (other_x, other_y):
+                continue
+            a, b = other_x - x, other_y - y
+            c = (other_x ** 2 + other_y ** 2 - x ** 2 - y ** 2) / 2
+            clipped = []
+            for start, end in zip(polygon, polygon[1:] + polygon[:1]):
+                ds, de = a * start[0] + b * start[1] - c, a * end[0] + b * end[1] - c
+                if ds <= 0:
+                    clipped.append(start)
+                if (ds <= 0) != (de <= 0):
+                    t = ds / (ds - de)
+                    clipped.append((start[0] + t * (end[0] - start[0]),
+                                    start[1] + t * (end[1] - start[1])))
+            polygon = clipped
+        polygons.append(polygon)
+    return polygons
 
 
 @dataclass
@@ -210,6 +257,15 @@ class PlantAsset:
     months_in_service: int = 0
     last_month_depreciation: float = 0.0
     purchase_price_index: float = 1.0
+    operating_life_months: int = 0
+
+    def __post_init__(self):
+        if not self.operating_life_months:
+            self.operating_life_months = PLANT_OPERATING_LIFE_YEARS[self.plant_type] * 12
+
+    @property
+    def remaining_life_months(self):
+        return max(0, self.operating_life_months - self.months_in_service)
 
     def inflation_adjusted_cost(self, current_price_index):
         """Today's dollar equivalent for salvage, not an accounting revaluation."""
@@ -272,9 +328,11 @@ MARKET_BASE_PE = 18.0           # baseline market P/E ratio
 class Economy:
     """Tracks the business cycle: inflation, interest rates, market sentiment."""
     def __init__(self):
-        # cycle_phase runs 0..2pi; sin() gives boom/bust sentiment.
-        self.cycle_phase = random.uniform(0, 2 * math.pi)
-        self.cycle_speed = 2 * math.pi / random.uniform(60, 120)  # 5-10 yr cycles
+        self.regime = 'expansion'
+        self.regime_months = 0
+        self.deflation_months = 0
+        self.long_rate_anchor = BASE_INTEREST_RATE
+        self.last_cycle_event = None
         self.inflation = BASE_INFLATION
         self.interest_rate = BASE_INTEREST_RATE
         self.market_pe = MARKET_BASE_PE
@@ -286,13 +344,48 @@ class Economy:
         self.update(advance_prices=False)
 
     def update(self, advance_prices=True):
-        self.cycle_phase += self.cycle_speed
-        self.sentiment = math.sin(self.cycle_phase)
-
-        # Inflation rises in booms, falls in busts, plus noise.
-        self.inflation = max(-0.01, BASE_INFLATION
-                             + 0.02 * self.sentiment
-                             + random.uniform(-0.005, 0.005))
+        old_regime = self.regime
+        self.last_cycle_event = None
+        self.regime_months += 1
+        draw = random.random()
+        if self.deflation_months > 0:
+            self.regime = 'recession'
+        elif draw < .001:
+            self.deflation_months = random.randint(6, 15)
+            self.regime = 'recession'
+            self.last_cycle_event = 'RARE DEFLATIONARY CRISIS: prices fall and lenders tighten credit.'
+        elif self.regime == 'expansion':
+            if draw < .008:
+                self.regime = 'recession'  # shocks can skip a gentle slowdown
+            elif draw < min(.075, .018 + self.regime_months * .0005):
+                self.regime = 'slowdown'
+        elif self.regime == 'slowdown':
+            if draw < .13:
+                self.regime = 'recession'
+            elif draw > .87:
+                self.regime = 'expansion'
+        elif self.regime == 'recession':
+            if draw < min(.25, .03 + self.regime_months * .008):
+                self.regime = 'recovery'
+        elif draw < .035:
+            self.regime = 'recession'
+        elif draw > .85:
+            self.regime = 'expansion'
+        if self.regime != old_regime:
+            self.regime_months = 0
+            self.last_cycle_event = self.last_cycle_event or (
+                f'ECONOMIC CYCLE: {self.regime.upper()}. '
+                + ('Ordinary borrowing capacity is halved; acquisition financing is suspended.'
+                   if self.in_recession else 'Credit availability is normal.'))
+        target_sentiment = {'expansion': .65, 'slowdown': -.1, 'recession': -.8, 'recovery': .2}[self.regime]
+        self.sentiment = max(-1, min(1, self.sentiment * .75 + target_sentiment * .25
+                                    + random.uniform(-.12, .12)))
+        if self.deflation_months > 0:
+            self.inflation = random.uniform(-.025, -.005)
+            self.deflation_months -= 1
+        else:
+            self.inflation = max(.001, BASE_INFLATION + .02 * self.sentiment
+                                  + random.uniform(-.005, .005))
 
         # Central bank raises rates to fight inflation (Taylor-rule-ish).
         target_rate = BASE_INTEREST_RATE + 1.2 * (self.inflation - BASE_INFLATION) \
@@ -300,12 +393,29 @@ class Economy:
         # Rates move gradually toward target.
         self.interest_rate += (target_rate - self.interest_rate) * 0.2
         self.interest_rate = max(0.005, self.interest_rate)
+        # Long yields remember sustained high policy rates and decline slowly.
+        memory_weight = .08 if self.interest_rate > self.long_rate_anchor else .025
+        self.long_rate_anchor += (self.interest_rate - self.long_rate_anchor) * memory_weight
 
         # Market P/E expands in booms, contracts in busts.
         self.market_pe = max(8.0, MARKET_BASE_PE + 6.0 * self.sentiment
                              + random.uniform(-1.0, 1.0))
         if advance_prices:
             self.advance_price_level()
+        if self.last_cycle_event:
+            print(self.last_cycle_event)
+
+    @property
+    def in_recession(self):
+        return self.regime == 'recession'
+
+    @property
+    def credit_multiplier(self):
+        return RECESSION_CREDIT_MULTIPLIER if self.in_recession else 1.0
+
+    @property
+    def equity_cycle_factor(self):
+        return {'expansion': 1.12, 'slowdown': .97, 'recession': .78, 'recovery': 1.02}[self.regime]
 
     def advance_price_level(self):
         """Apply one month's share of the displayed annual rate, including deflation."""
@@ -329,8 +439,7 @@ class Economy:
         return (RENEWABLE_MATURE_COST[plant_type] / base) ** progress
 
     def display(self):
-        mood = ("BOOM" if self.sentiment > 0.4 else
-                "RECESSION" if self.sentiment < -0.4 else "STABLE")
+        mood = self.regime.upper()
         print("\n--- Economy ---")
         print(f"Cycle: {mood} (sentiment {self.sentiment:+.2f})")
         print(f"Inflation: {self.inflation * 100:.2f}%   "
@@ -342,7 +451,9 @@ class Economy:
     # Economy
     def bond_rate(self, term_years, credit_spread):
         term_premium = 0.0015 * math.log1p(term_years)
-        return self.interest_rate + term_premium + credit_spread
+        memory_weight = term_years / (term_years + 3)
+        base = self.interest_rate * (1 - memory_weight) + self.long_rate_anchor * memory_weight
+        return base + term_premium + credit_spread
 
 # Bond terms available (in months) and labels.
 BOND_TERMS = {
@@ -413,30 +524,39 @@ RATE_REQUEST_COOLDOWN = 12      # months before requests stop being "frequent"
 class RateRegulator:
     def __init__(self, economy=None):
         self.economy = economy
-        self._real_retail_price = RETAIL_PRICE_PER_MWH
+        self._nominal_retail_price = RETAIL_PRICE_PER_MWH
         self.last_request_turn = -999
         self.recent_requests = 0
 
     @property
     def current_retail_price(self):
-        return self._real_retail_price * getattr(self.economy, 'price_index', 1.0)
+        return self._nominal_retail_price
 
     @current_retail_price.setter
     def current_retail_price(self, nominal_price):
-        self._real_retail_price = nominal_price / getattr(self.economy, 'price_index', 1.0)
+        self._nominal_retail_price = nominal_price
+
+    @staticmethod
+    def recurring_margin(financials):
+        pretax = financials.operating_income - financials.interest_expense
+        recurring_net = pretax - max(0, pretax * CORPORATE_TAX_RATE)
+        return recurring_net / max(financials.total_operating_revenue, 1)
 
     def request_increase(self, player_state, financials, economy, current_turn, pct):
-        """Ask for an increase above the tariff's automatic inflation adjustment."""
-        # Estimate current net margin.
-        rev = max(financials.revenue, 1)
-        margin = (financials.net_profit * 12) / rev
+        """Manual rate relief for weak recurring margins, never disposal losses."""
+        if (not isinstance(pct, (int, float)) or isinstance(pct, bool)
+                or not math.isfinite(pct) or not 0 < pct <= .5):
+            print('Rate request rejected: choose an increase greater than 0% and at most 50%.')
+            return False
+        margin = self.recurring_margin(financials)
+        if margin >= FAIRNESS_MARGIN_CAP:
+            print(f'Rate request ineligible: recurring after-interest margin is {margin:.1%}; '
+                  'relief requires less than 12%. Retirement and debt gains/losses are excluded.')
+            return False
 
         # Base approval probability shrinks as margin nears the cap.
         headroom = max(0.0, FAIRNESS_MARGIN_CAP - margin)
-        base_prob = min(0.9, headroom / FAIRNESS_MARGIN_CAP)
-
-        # Inflation is already passed through automatically, so it does not
-        # independently justify an additional real-price rate increase.
+        base_prob = min(0.95, .45 + .5 * headroom / FAIRNESS_MARGIN_CAP)
 
         # Frequency penalty.
         months_since = current_turn - self.last_request_turn
@@ -518,7 +638,7 @@ class CreditRating:
     def update(self, player_state, financials):
         # Borrowing and keeping the proceeds leaves net debt and book equity
         # unchanged; market-price swings must not create a downgrade spiral.
-        equity = player_state.book_equity()
+        equity = player_state.book_equity() + getattr(player_state, 'retirement_credit_adjustment', 0)
         net_debt = max(0.0, player_state.net_debt())
         self.net_leverage = net_debt / equity if equity > 0 else float('inf')
         annual_interest = sum(b.monthly_interest() for b in player_state.bonds) * 12
@@ -526,6 +646,8 @@ class CreditRating:
         # supply only annual revenue/costs still use the same cash-profit measure.
         operating_profit = getattr(financials, 'ttm_ebitda',
                                    financials.revenue - financials.operational_costs)
+        operating_profit += sum(item['monthly_ebitda'] * item['months_left']
+                                for item in getattr(player_state, 'acquired_ebitda_support', []))
         self.interest_coverage = (operating_profit / annual_interest if annual_interest > 0
                                   else float('inf') if operating_profit > 0 else 0.0)
         if self._forced_start:
@@ -725,7 +847,8 @@ class GameState:
         self.last_demand_event_msg = None
 
         # Baseline compounding growth.
-        self.demand_index *= (1 + MONTHLY_DEMAND_GROWTH)
+        cyclical_growth = (.008 * getattr(self.economy, 'sentiment', 0)) / 12
+        self.demand_index *= (1 + MONTHLY_DEMAND_GROWTH + cyclical_growth)
 
         # Maybe trigger a new economic event.
         if random.random() < DEMAND_EVENT_MONTHLY_CHANCE:
@@ -810,13 +933,18 @@ class GameState:
 
 
 class PlayerState:
-    def __init__(self, economy=None):
+    def __init__(self, economy=None, territory_mw=None):
         self.economy = economy
         # Company scale determines territory and the inherited financing package.
-        scale_value = random.uniform(MIN_COMPANY_SIZE, MAX_COMPANY_SIZE)
+        scale_value = (random.uniform(MIN_COMPANY_SIZE, MAX_COMPANY_SIZE)
+                       if territory_mw is None else territory_mw * 1_000_000)
         self.company_value = scale_value
         self.cash = scale_value * random.uniform(0.03, 0.06)
-        self.base_territory_mw = scale_value / 1_000_000
+        self.base_territory_mw = scale_value / 1_000_000 if territory_mw is None else territory_mw
+        self.service_territories = []
+        self.goodwill = 0.0
+        self.retirement_credit_adjustment = 0.0
+        self.acquired_ebitda_support = []
         self._dividend_initialized = False
         self.dividends_paid = 0
         self.reputation = 0.5
@@ -936,11 +1064,11 @@ class PlayerState:
                                        for fraction in OPENING_PLANT_AGE_FRACTION_RANGE))
                 inherited.append((plant_type, age))
         raw_plant_cost = sum(
-            count * PLANT_BUILD_COST.get(plant_type, 0)
+            count * PLANT_BUILD_COST.get(plant_type, 0) * self.price_index
             for plant_type, count in self.power_plants.items()
         )
         raw_net_plant = sum(
-            PLANT_BUILD_COST[kind] * (1 - age / (ASSET_USEFUL_LIFE_YEARS[kind] * 12))
+            PLANT_BUILD_COST[kind] * self.price_index * (1 - age / (ASSET_USEFUL_LIFE_YEARS[kind] * 12))
             for kind, age in inherited
         )
         minimum_equity = max(MIN_OPENING_BOOK_EQUITY, raw_plant_cost * 0.05)
@@ -950,7 +1078,7 @@ class PlayerState:
         )
         for plant_type, age in inherited:
             self._add_plant_asset(plant_type, PLANT_BUILD_COST[plant_type]
-                                  * self.opening_asset_cost_scale, months_in_service=age)
+                                  * self.opening_asset_cost_scale * self.price_index, months_in_service=age)
         if self.opening_asset_cost_scale > 1.0001:
             print("Opening plant purchase basis was increased "
                   f"{(self.opening_asset_cost_scale - 1) * 100:.1f}% so book equity "
@@ -1003,7 +1131,7 @@ class PlayerState:
                    for project in self.ongoing_constructions)
 
     def total_asset_value(self):
-        return self.cash + self.net_utility_plant() + self.construction_work_in_progress()
+        return self.cash + self.net_utility_plant() + self.construction_work_in_progress() + self.goodwill
 
     def book_equity(self):
         """Accounting equity: assets at purchase cost, less debt."""
@@ -1021,7 +1149,24 @@ class PlayerState:
                 asset.last_month_depreciation = expense
         if post:
             self._sync_plant_book_values()
+            # A unit supplies its final service month, then leaves the fleet.
+            # Disposal entries must be posted before this month's accounts close.
+            self.retire_expired_plants()
+            for asset in self.plant_assets:
+                if asset.remaining_life_months in {
+                        PLANT_CONSTRUCTION_MONTHS[asset.plant_type] + 12, 12, 1}:
+                    print(f"PLANT AGE WARNING: {asset.plant_type} #{asset.asset_id} must retire "
+                          f"in {asset.remaining_life_months} months. Plan replacement capacity.")
         return total
+
+    def retire_expired_plants(self):
+        """Retire exact expired units, including old saves, with normal disposal entries."""
+        expired = [a for a in self.plant_assets if a.remaining_life_months == 0]
+        for asset in expired:
+            print(f"END OF SERVICE: {asset.plant_type} #{asset.asset_id} reached "
+                  f"{asset.operating_life_months / 12:g} years and has stopped working.")
+            self._retire_assets([asset])
+        return expired
 
     def reset_monthly_ledgers(self):
         self.capital_expenditures_since_close = 0.0
@@ -1033,6 +1178,8 @@ class PlayerState:
         self.debt_gain_loss_since_close = 0.0
         self.stock_issued_since_close = 0.0
         self.stock_bought_since_close = 0.0
+        self.acquisition_spending_since_close = 0.0
+        self.acquisition_debt_issued_since_close = 0.0
         # Fix the allowance for the coming month using non-cash book assets.
         # Cash from borrowing never enlarges it, even at the next month close.
         self.borrowing_asset_base = max(
@@ -1044,7 +1191,19 @@ class PlayerState:
 
     def remaining_borrowing_capacity(self):
         """Unused gross issuance allowance; repayments do not replenish it."""
-        return max(0.0, self.monthly_borrowing_limit - self.debt_issued_since_close)
+        ordinary_issued = self.debt_issued_since_close - self.acquisition_debt_issued_since_close
+        return max(0.0, self.effective_borrowing_limit() - ordinary_issued)
+
+    def effective_borrowing_limit(self):
+        return self.monthly_borrowing_limit * getattr(self.economy, 'credit_multiplier', 1.0)
+
+    def expected_demand(self, state, month=None, demand_index=None):
+        month = state.current_month if month is None else month
+        demand_index = state.demand_index if demand_index is None else demand_index
+        if len(self.service_territories) <= 1:
+            return self.base_territory_mw * demand_index * state.seasonal_demand_multiplier(month)
+        return sum(area['base_mw'] * area['index_ratio'] * demand_index
+                   * regional_seasonality(area['climate'], month) for area in self.service_territories)
 
     def _borrowing_request_allowed(self, amount):
         if (not isinstance(amount, (int, float)) or isinstance(amount, bool)
@@ -1054,7 +1213,7 @@ class PlayerState:
         remaining = self.remaining_borrowing_capacity()
         if amount > remaining:
             print(f"Borrowing failed: only ${remaining:,.2f} remains of this month's "
-                  f"${self.monthly_borrowing_limit:,.2f} limit. Bonds and emergency "
+                  f"${self.effective_borrowing_limit():,.2f} limit. Bonds and emergency "
                   "loans share the limit; repayments do not restore it.")
             return False
         return True
@@ -1109,6 +1268,7 @@ class PlayerState:
         # --- Investor confidence premium/discount (-15% to +15%) ---
         confidence_adj = 1.0 + (self.investor_confidence - 0.5) * 0.30
         fair_value *= confidence_adj
+        fair_value *= economy.equity_cycle_factor
         
         # --- 5. Yield sanity: reward/punish vs. prevailing bond yields ---
         if self.stock_price > 0:
@@ -1150,20 +1310,37 @@ class PlayerState:
         if owned < quantity:
             print(f"Cannot retire {quantity} {plant_type} plants; only {owned} are owned.")
             return False
-        salvage_frac, teardown = DECOMMISSION_INFO[plant_type]
         # Retire newest units first, consistently with battery retirement.
         retired = [asset for asset in self.plant_assets
                    if asset.plant_type == plant_type][-quantity:]
+        return self._retire_assets(retired)
+
+    def _retire_assets(self, retired):
+        """Remove selected assets; battery register order matches the battery list."""
+        if not retired or any(asset not in self.plant_assets for asset in retired):
+            return False
+        plant_type = retired[0].plant_type
+        if any(asset.plant_type != plant_type for asset in retired):
+            raise ValueError('Retire one technology at a time.')
+        quantity = len(retired)
+        if plant_type == 'battery':
+            battery_assets = [a for a in self.plant_assets if a.plant_type == 'battery']
+            for index in sorted((battery_assets.index(a) for a in retired), reverse=True):
+                self.batteries.pop(index)
+            salvage_frac, teardown = .10, 0
+        else:
+            salvage_frac, teardown = DECOMMISSION_INFO[plant_type]
+            self.power_plants[plant_type] -= quantity
         net = sum(asset.inflation_adjusted_cost(self.price_index) * salvage_frac
                   - teardown * self.price_index for asset in retired)
         net_book_removed = sum(asset.net_book_value for asset in retired)
         for asset in retired:
             self.plant_assets.remove(asset)
         self._sync_plant_book_values()
-        self.power_plants[plant_type] -= quantity
         self.cash += net
         self.asset_sale_proceeds_since_close += net
         self.disposal_gain_loss_since_close += net - net_book_removed
+        self.retirement_credit_adjustment += max(0, net_book_removed - net)
         noun = "plant" if quantity == 1 else "plants"
         if net >= 0:
             print(f"Decommissioned {quantity} {plant_type} {noun}. Net proceeds: ${net:,.0f} "
@@ -1183,27 +1360,15 @@ class PlayerState:
             return False
         retired = [asset for asset in self.plant_assets
                    if asset.plant_type == 'battery'][-quantity:]
-        net_book_removed = sum(asset.net_book_value for asset in retired)
-        for _ in range(quantity):
-            self.batteries.pop()
-        salvage = sum(asset.inflation_adjusted_cost(self.price_index) * 0.10 for asset in retired)
-        for asset in retired:
-            self.plant_assets.remove(asset)
-        self._sync_plant_book_values()
-        self.cash += salvage
-        self.asset_sale_proceeds_since_close += salvage
-        self.disposal_gain_loss_since_close += salvage - net_book_removed
-        noun = "unit" if quantity == 1 else "units"
-        print(f"Decommissioned {quantity} battery {noun}. Salvage: ${salvage:,.0f}.")
-        return True
+        return self._retire_assets(retired)
 
     def wholesale_trade(self, mw, direction, economy):
         """Replace the recurring net contract, effective starting next month."""
-        if (direction not in ('buy', 'sell') or not isinstance(mw, (int, float))
+        if (direction != 'buy' or not isinstance(mw, (int, float))
                 or isinstance(mw, bool) or not math.isfinite(mw) or mw < 0):
-            print("Power contract failed: choose buy or sell and a finite, nonnegative MW amount.")
+            print("Power purchases only: enter a finite, nonnegative MW amount. Selling is disabled.")
             return False
-        self.pending_wholesale_commitment_mw = mw if direction == 'buy' else -mw
+        self.pending_wholesale_commitment_mw = mw
         if mw == 0:
             print("Recurring power contract will stop next month.")
         else:
@@ -1493,7 +1658,13 @@ class PlayerState:
         # Target: cover PEAK demand plus the reserve margin, using FIRM capacity.
         # Peak = territory * worst-case seasonal multiplier (~1.35 in hot/cold climates).
         peak_demand = self.base_territory_mw * 1.35
-        target = peak_demand * (1 + TARGET_RESERVE_MARGIN)  # ~15% cushion above peak
+        target = peak_demand * .99  # inherited fleet is just short of the seasonal peak
+        while firm_fleet_capacity() > target:
+            removable = next((kind for kind in ('coal', 'natural_gas', 'nuclear')
+                              if self.power_plants[kind] > (1 if kind == 'natural_gas' else 0)), None)
+            if removable is None:
+                break
+            self.power_plants[removable] -= 1
 
         # Fill the inherited reliability requirement only with fossil units.
         # Clean generation must be developed by the player after game start.
@@ -1503,8 +1674,9 @@ class PlayerState:
 
         max_additions = 200
         additions = 0
-        while firm_fleet_capacity() < target and additions < max_additions:
-            choice = random.choices(types, weights=weights, k=1)[0]
+        while firm_fleet_capacity() + NATURAL_GAS_PLANT_CAPACITY <= target and additions < max_additions:
+            eligible = [kind for kind in types if firm_fleet_capacity() + PLANT_NAMEPLATE_CAPACITY[kind] <= target]
+            choice = random.choices(eligible, weights=[build_weights[k] for k in eligible], k=1)[0]
             self.power_plants[choice] += 1
             additions += 1
 
@@ -1637,7 +1809,7 @@ class PlayerState:
         print(f"Cash: ${self.cash:,.2f}")
         print(f"Debt: ${self.total_debt():,.2f}")
         print(f"Company Value: ${self.company_value:,.2f}")
-        print(f"Debt-to-Equity Ratio: {self.total_debt() / max(self.equity, 1):.2f}")
+        print(f"Debt-to-Book-Equity Ratio: {self.total_debt() / max(self.book_equity(), 1):.2f}")
         print(f"Reputation: {self.reputation:.2f} (0.0-1.0)")
         print("\n--- Player Assets ---")
         label_map = {
@@ -1747,10 +1919,7 @@ class PowerGrid:
 
     def calculate_demand(self, player_state, game_state):
         fluctuation = random.uniform(-DEMAND_MONTHLY_VARIATION, DEMAND_MONTHLY_VARIATION)
-        self.total_demand = (player_state.base_territory_mw
-                             * (1 + fluctuation)
-                             * game_state.demand_multiplier
-                             * game_state.demand_index)
+        self.total_demand = player_state.expected_demand(game_state) * (1 + fluctuation)
         return self.total_demand
 
     def forecast_demand(self, player_state, game_state, months=DEMAND_FORECAST_MONTHS):
@@ -1761,16 +1930,26 @@ class PowerGrid:
         contract = (player_state.pending_wholesale_commitment_mw
                     if player_state.pending_wholesale_commitment_mw is not None
                     else player_state.wholesale_commitment_mw)
+        retirement_schedule = {}
+        battery_index = 0
+        for asset in player_state.plant_assets:
+            capacity = PLANT_NAMEPLATE_CAPACITY[asset.plant_type] * CAPACITY_CREDIT[asset.plant_type]
+            if asset.plant_type == 'battery':
+                battery = player_state.batteries[battery_index]
+                battery_index += 1
+                capacity *= battery['current_capacity'] / max(battery['max_capacity'], 1)
+            first_offline = asset.remaining_life_months + 1
+            retirement_schedule[first_offline] = retirement_schedule.get(first_offline, 0) + capacity
+        retired_capacity = 0.0
         for step in range(1, months + 1):
-            demand_index *= 1 + MONTHLY_DEMAND_GROWTH
+            demand_index *= 1 + MONTHLY_DEMAND_GROWTH + .008 * getattr(game_state.economy, 'sentiment', 0) / 12
             for event in game_state.active_demand_events:
                 if event['months_left'] >= step:
                     demand_index *= 1 + event['monthly_pressure']
             year_offset, month_index = divmod(game_state.current_month - 1 + step, 12)
             month = month_index + 1
             year = game_state.year + year_offset
-            expected = (player_state.base_territory_mw * demand_index
-                        * game_state.seasonal_demand_multiplier(month))
+            expected = player_state.expected_demand(game_state, month, demand_index)
             low = expected * (1 - DEMAND_MONTHLY_VARIATION)
             high = expected * (1 + DEMAND_MONTHLY_VARIATION)
             completed_capacity = sum(
@@ -1778,7 +1957,8 @@ class PowerGrid:
                 for project in player_state.ongoing_constructions
                 if project['turns_remaining'] <= step
             )
-            firm_supply = current_firm + completed_capacity + contract
+            retired_capacity += retirement_schedule.get(step, 0)
+            firm_supply = max(0, current_firm - retired_capacity) + completed_capacity + max(0, contract)
             forecast.append({
                 'month': month, 'year': year,
                 'label': f'{MONTH_NAMES[month - 1][:3].title()} {year}',
@@ -1831,7 +2011,7 @@ class PowerGrid:
         gas_available = player_state.power_plants['natural_gas'] * NATURAL_GAS_PLANT_CAPACITY
         self.maximum_generation = baseload + gas_available
         self.contract_imports_mw = max(0.0, player_state.wholesale_commitment_mw)
-        self.contract_exports_mw = max(0.0, -player_state.wholesale_commitment_mw)
+        self.contract_exports_mw = 0.0
         # Export commitments consume output; imports meet load before peakers.
         supply = baseload + self.contract_imports_mw - self.contract_exports_mw
         deficit = max(0.0, self.total_demand - supply)
@@ -1864,7 +2044,7 @@ class PowerGrid:
         self.current_surplus_deficit = self.available_for_customers - self.total_demand
         # Balance any remaining gap in the spot market, at less favorable prices.
         self.spot_imports_mw = max(0.0, -self.current_surplus_deficit)
-        self.spot_exports_mw = max(0.0, self.current_surplus_deficit)
+        self.spot_exports_mw = 0.0  # surplus is curtailed, never sold
 
     def display_grid_status(self, player_state=None):
         print("\n--- Power Grid Status ---")
@@ -1947,6 +2127,7 @@ class Financials:
         self.net_cash_from_operations = 0
         self.capital_expenditures = 0
         self.asset_sale_proceeds = 0
+        self.acquisition_spending = 0.0
         self.net_cash_from_investing = 0
         self.debt_issuance = 0
         self.debt_repayments = 0
@@ -2056,12 +2237,8 @@ class Financials:
         self.monthly_electric_revenue = (
             power_grid.total_demand * regulator.current_retail_price * HOURS_PER_MONTH
         )
-        self.contract_sales_revenue = (
-            power_grid.contract_exports_mw * HOURS_PER_MONTH * price * CONTRACT_SELL_FACTOR
-        )
-        self.spot_sales_revenue = (
-            power_grid.spot_exports_mw * HOURS_PER_MONTH * price * SPOT_SELL_FACTOR
-        )
+        self.contract_sales_revenue = 0.0
+        self.spot_sales_revenue = 0.0
         self.contract_purchase_cost = (
             power_grid.contract_imports_mw * HOURS_PER_MONTH * price * CONTRACT_BUY_FACTOR
         )
@@ -2075,7 +2252,7 @@ class Financials:
         return self.revenue
 
     def update_player_financials(self, player_state, game_state, power_grid,
-                                 economy, regulator, valuation_only=False):
+                                 economy, regulator, valuation_only=False, liquidity_provider=None):
         # Management transactions occur at the month boundary, so the post-trade
         # share count is the full month's weighted-average shares.
         self.monthly_weighted_shares = player_state.shares_outstanding
@@ -2140,6 +2317,10 @@ class Financials:
                                          self.ttm_eps(player_state.shares_outstanding))
         player_state.pay_quarterly_dividend(game_state)
         player_state.review_dividend_policy(game_state)
+        if liquidity_provider is not None:
+            # Autonomous utilities fund the actual shortfall, including overruns,
+            # coupons and maturities, before the immutable monthly close is stored.
+            liquidity_provider()
         player_state.equity = player_state.company_value
 
         # Indirect-method cash-flow statement. Gains and losses are removed from
@@ -2151,7 +2332,9 @@ class Financials:
         self.asset_sale_proceeds = player_state.asset_sale_proceeds_since_close
         self.net_cash_from_investing = (
             -self.capital_expenditures + self.asset_sale_proceeds
+            - player_state.acquisition_spending_since_close
         )
+        self.acquisition_spending = player_state.acquisition_spending_since_close
         self.debt_issuance = player_state.debt_issued_since_close
         self.debt_repayments = player_state.debt_repaid_since_close
         self.dividend_payments = player_state.dividends_since_close
@@ -2171,6 +2354,8 @@ class Financials:
         self.net_change_in_cash = actual_change
         self.has_closed_month = True
         utility_reports.store_close(self, player_state, game_state)
+        for item in player_state.acquired_ebitda_support:
+            item['months_left'] = max(0, item['months_left'] - 1)
         player_state.reset_monthly_ledgers()
 
 
@@ -2214,7 +2399,7 @@ def check_bankruptcy(player_state, credit):
 
 
 def player_action_menu(player_state, economy, regulator, financials, credit, current_turn,
-                       game_state=None):
+                       game_state=None, session=None):
     build_options = {
         '1': 'coal', '2': 'natural_gas', '3': 'nuclear', '4': 'solar',
         '5': 'wind', '6': 'battery', '13': 'hydro',
@@ -2238,7 +2423,7 @@ def player_action_menu(player_state, economy, regulator, financials, credit, cur
               f"| Debt: ${player_state.total_debt():,.0f} | Rating: {credit.rating}")
         print(f"Net debt (bonds - cash): ${player_state.net_debt():,.0f} | "
               f"Borrowing left this month: ${player_state.remaining_borrowing_capacity():,.0f} "
-              f"of ${player_state.monthly_borrowing_limit:,.0f}")
+              f"of ${player_state.effective_borrowing_limit():,.0f}")
         print(f"Power contract: {power_contract_description(player_state.wholesale_commitment_mw)}")
         if player_state.pending_wholesale_commitment_mw is not None:
             print('Next month: ' + power_contract_description(player_state.pending_wholesale_commitment_mw))
@@ -2247,11 +2432,13 @@ def player_action_menu(player_state, economy, regulator, financials, credit, cur
             print("  *** WARNING: CASH IS NEGATIVE. You must raise cash before ending the turn. ***")
         print("  Build:  1 Coal  2 Gas  3 Nuclear  4 Solar  5 Wind  6 Battery  13 Hydro")
         print("  Decommission:  a Coal  b Gas  c Nuclear  d Solar  e Wind  f Battery  g Hydro")
-        print("  7 Issue bond  8 Rate increase  9 Wholesale trade  10 Set dividend")
+        print("  7 Issue bond  8 Rate increase  9 Buy power  10 Set dividend")
         print(" 11 Toggle battery dispatch  0 End turn")
         print(" 12 Emergency loan (high interest, last resort)")
         print(" 14 Demand forecast (next 24 months)")
         print(" 15 Issue stock  16 Buy back stock")
+        if session is not None:
+            print(' 17 Regions and competitors  18 Acquire a utility')
         if player_state.fired:
             return 'FIRED'
 
@@ -2290,13 +2477,11 @@ def player_action_menu(player_state, economy, regulator, financials, credit, cur
                 continue
             player_state.issue_bond(amt_millions * 1_000_000, economy, term, credit)
         elif choice == '8':
-            pct = float(input("Increase above automatic inflation adjustment (e.g. 0.05): "))
+            pct = float(input("Manual rate increase (e.g. 0.05; recurring margin below 12% required): "))
             regulator.request_increase(player_state, financials, economy, current_turn, pct)
         elif choice == '9':
-            d = input("buy or sell? ").strip().lower()
             mw = float(input("Recurring MW from next month (0 cancels): "))
-            if d in ('buy','sell'):
-                player_state.wholesale_trade(mw, d, economy)
+            player_state.wholesale_trade(mw, 'buy', economy)
         elif choice == '10':
             div = float(input("New annual dividend per share $: "))
             player_state.set_dividend(div)
@@ -2321,15 +2506,39 @@ def player_action_menu(player_state, economy, regulator, financials, credit, cur
                                          quantity, game_state)
             except ValueError:
                 print('Enter a whole number of shares.')
+        elif choice == '17' and session is not None:
+            for row in session.competitor_rows():
+                print(f"{row['region_id'] + 1}: {row['name']} | market {compact_money(row['market_cap'])} | "
+                      f"assets {compact_money(row['assets'])} | debt {compact_money(row['liabilities'])} | {row['credit']}")
+        elif choice == '18' and session is not None:
+            try:
+                rid = int(input('Region number (2–10): ')) - 1
+                quote = session.acquisition_quote(rid)
+                print(f"Closing price {compact_money(quote['total'])}; assumed debt {compact_money(quote['assumed_debt'])}; "
+                      f"dedicated financing up to {compact_money(quote['financing_limit'])} at {quote['rate']:.2%}.")
+                amount = float(input('Acquisition financing ($ millions, 0 for cash): ')) * 1e6
+                if input('Confirm acquisition? [yes/no]: ').strip().lower() == 'yes':
+                    session.buy_utility(rid, amount)
+            except ValueError as exc:
+                print(exc)
         else:
             print("Invalid.")
             
 
-def play_turn(game_state, player_state, power_grid, financials, economy, regulator, credit):
+def play_turn(game_state, player_state, power_grid, financials, economy, regulator, credit, session=None):
     print(f"\n--- {MONTH_NAMES[game_state.current_month-1]}, YEAR {game_state.year} ---")
     result = player_action_menu(player_state, economy, regulator, financials, credit,
-                                game_state.turn, game_state)
+                                game_state.turn, game_state, session)
     if result in ('BANKRUPT', 'FIRED'):
+        return result
+    if session is not None:
+        result = session.advance_month()
+        game_state.display_env_status()
+        economy.display()
+        power_grid.display_grid_status(player_state)
+        financials.display_financial_summary()
+        player_state.display_player_status()
+        credit.display()
         return result
 
     economy.update()
@@ -2339,6 +2548,7 @@ def play_turn(game_state, player_state, power_grid, financials, economy, regulat
     game_state.display_env_status()
     economy.display()
     player_state.update_constructions()
+    player_state.retire_expired_plants()
     power_grid.update_grid_status(player_state, game_state)
     power_grid.display_grid_status(player_state)
     financials.update_player_financials(player_state, game_state, power_grid, economy, regulator)
@@ -2370,7 +2580,7 @@ def run_game(num_turns):
     print("\n--- Game Start ---")
     for _ in range(num_turns):
         result = play_turn(game_state, player_state, power_grid, financials,
-                           economy, regulator, credit)
+                           economy, regulator, credit, session)
         if result == "FIRED":
             print("\n=== GAME OVER: Shareholders have fired you after losing confidence. ===")
             return
@@ -2414,8 +2624,8 @@ def compact_money(value):
 STATEMENT_DEFINITIONS = {
     'Electric revenue': (
         "Revenue from retail customers. Power bought to meet their demand is reported "
-        "separately as purchased-power expense. Retail tariffs automatically follow "
-        "cumulative inflation; approved rate cases add increases above inflation."
+        "separately as purchased-power expense. Retail tariffs change only after "
+        "an approved manual rate case, not automatically with inflation."
     ),
     'Contract power sales': 'Recurring export MW × 730 monthly hours × the monthly contract sale price.',
     'Spot power sales': 'Revenue from surplus remaining after customer demand and export commitments.',
@@ -2499,6 +2709,8 @@ STATEMENT_DEFINITIONS = {
     'Long-term debt': "Bond principal due more than 12 months from now.",
     'Total debt': "All outstanding bond principal, both current and long term.",
     'Paid-in capital': "Opening shareholder book capital plus net proceeds from stock issuance.",
+    'Acquisition goodwill': 'Purchase price and closing costs above acquired net book assets. Not depreciated or eligible as borrowing collateral in this model.',
+    'Acquisitions, net of cash acquired': 'Cash paid to acquire utilities, including closing costs, minus the cash inherited from them. Assumed debt is a non-cash liability transfer.',
     'Retained earnings': (
         "Cumulative book profit kept in the business after dividends and other equity changes."
     ),
@@ -2574,6 +2786,198 @@ class HoverTooltip:
             self.tip = None
 
 
+class RegionalUtility:
+    """An autonomous utility with actual transferable accounts, plants and bonds."""
+
+    def __init__(self, economy, territory_mw, climate, state):
+        self.economy = economy
+        self.game_state = GameState(economy)
+        self.game_state.climate = climate
+        latitude_range = {'hot': (20, 32), 'cold': (51, 65), 'temperate': (33, 50)}[climate]
+        self.game_state.latitude = random.uniform(*latitude_range)
+        self.game_state.year, self.game_state.current_month = state.year, state.current_month
+        self.game_state.turn = state.turn
+        self.game_state.update_seasonal_conditions()
+        self.player = PlayerState(economy, territory_mw)
+        self.regulator = RateRegulator(economy)
+        self.financials = Financials()
+        self.grid = PowerGrid()
+        self.credit = CreditRating()
+        self.investment_preference = random.choice(('solar', 'wind', 'natural_gas'))
+        self.acquired = False
+        self.grid.update_grid_status(self.player, self.game_state)
+        self.financials.update_player_financials(self.player, self.game_state, self.grid,
+                                                economy, self.regulator, valuation_only=True)
+        utility_reports.seed_history(self)
+        self.player.stock_price = 0
+        self.player._dividend_initialized = False
+        self.player.update_stock_price(economy, self.financials.ttm_net_income,
+                                      self.financials.ttm_eps(self.player.shares_outstanding))
+        self.credit.update(self.player, self.financials)
+
+    def ensure_liquidity(self):
+        """Fund actual cash deficits with debt, never an unrecorded cash floor.
+
+        Ordinary bonds come first. A competitor-only continuity facility covers
+        essential bills beyond that limit, even in a credit crunch. It cannot
+        finance discretionary construction or be drawn by the human player.
+        """
+        p = self.player
+        if self.acquired or p.cash >= 0:
+            return 0.0
+        needed = -p.cash
+        ordinary = min(needed, p.remaining_borrowing_capacity())
+        if ordinary > 0 and self.credit.can_borrow:
+            p.issue_bond(ordinary, self.economy, '10yr', self.credit)
+        if p.cash < 0:
+            amount = -p.cash
+            spread = self.credit.spread if self.credit.spread is not None else .14
+            rate = self.economy.bond_rate(10, spread + .015)
+            bond = Bond(amount, rate, 10, self.game_state.turn)
+            bond.purpose = 'regional_liquidity'
+            p.bonds.append(bond)
+            p.cash += amount
+            p.debt_issued_since_close += amount
+            print(f"REGIONAL CONTINUITY LOAN: ${amount:,.0f} at {rate:.2%} "
+                  "to settle essential obligations; principal and interest remain payable.")
+        return needed
+
+    def generation_running_cost(self, kind, future=False):
+        state = self.game_state
+        costs = {'coal': COAL_COST_PER_MWH * self.economy.price_index,
+                 'natural_gas': state.natural_gas_price,
+                 'nuclear': NUCLEAR_COST_PER_MWH * self.economy.price_index,
+                 'solar': SOLAR_COST_PER_MWH * self.economy.price_index,
+                 'wind': WIND_COST_PER_MWH * self.economy.price_index,
+                 'hydro': HYDRO_COST_PER_MWH * self.economy.price_index}
+        carbon = state.carbon_tax
+        if future:
+            carbon *= (1 + state._carbon_tax_annual_growth) ** 5
+        emissions = {'coal': COAL_EMISSIONS_TONS_PER_MWH, 'natural_gas': GAS_EMISSIONS_TONS_PER_MWH}
+        return costs[kind] + emissions.get(kind, 0) * carbon
+
+    def plan_portfolio(self):
+        """Replace uneconomic fossil units and plan for known physical retirements."""
+        p, state = self.player, self.game_state
+        import_cost = wholesale_market_price(self.economy) * SPOT_BUY_FACTOR
+        for kind in ('coal', 'natural_gas'):
+            if (p.power_plants[kind] and self.generation_running_cost(kind)
+                    > min(self.regulator.current_retail_price * .90, import_cost * 1.25)):
+                # Spot purchases bridge the construction lead time. Do not keep
+                # burning fuel whose carbon-adjusted cost exceeds replacement power.
+                p.decommission_plant(kind, p.power_plants[kind])
+
+        due = sum(b.principal for b in p.bonds if b.months_remaining <= 1)
+        interest = sum(b.monthly_interest() for b in p.bonds)
+        reserve = due + interest + max(0, self.financials.cash_operating_expenses
+                                      - self.financials.total_operating_revenue)
+        reserve += max(1e6 * p.price_index, self.financials.total_operating_revenue * .10)
+        horizon = 84 if any(a.remaining_life_months <= PLANT_CONSTRUCTION_MONTHS[a.plant_type] + 12
+                           and PLANT_CONSTRUCTION_MONTHS[a.plant_type] > 24
+                           for a in p.plant_assets) else 24
+        capacity_factors = {'natural_gas': .70, 'nuclear': 1.0, 'solar': .50, 'wind': .50, 'hydro': .75}
+        for _ in range(4):  # allow several small projects, without an unbounded building loop
+            forecast = self.grid.forecast_demand(p, state, horizon)
+            # Imports are a bridge, not a permanent substitute for owned capacity.
+            imports = max(0, p.wholesale_commitment_mw)
+            shortage = max(row['high'] * 1.08 - row['firm_supply'] + imports for row in forecast)
+            if shortage <= 0:
+                break
+            cash_available = max(0, p.cash - reserve)
+            spread = self.credit.spread if self.credit.spread is not None else .14
+            build_rate = self.economy.bond_rate(20, spread)
+            earnings = max(0, self.financials.ttm_ebitda)
+            annual_interest = sum(b.monthly_interest() for b in p.bonds) * 12
+            # Access to a monthly allowance is not proof that more debt is
+            # affordable. Leave room for interest and principal refinancing.
+            credit_available = (min(p.remaining_borrowing_capacity(),
+                max(0, earnings * 4 - max(0, p.net_debt())),
+                max(0, (earnings / 2.5 - annual_interest) / build_rate))
+                if self.credit.can_borrow else 0)
+            candidates = []
+            for kind, factor in capacity_factors.items():
+                cost = p.construction_cost(kind)
+                if cost > cash_available + credit_available:
+                    continue
+                running = self.generation_running_cost(kind, future=True)
+                if kind == 'natural_gas' and running > import_cost * 1.25:
+                    continue
+                annual_output = PLANT_NAMEPLATE_CAPACITY[kind] * factor * HOURS_PER_YEAR
+                score = running + cost * (max(.045, build_rate) + 1 / PLANT_OPERATING_LIFE_YEARS[kind]) / annual_output
+                # Do not borrow for projects whose annual operating savings
+                # cannot cover their added interest. Cash-funded replacement
+                # remains possible, and imports bridge an unaffordable build.
+                borrowing = max(0, cost - cash_available)
+                savings = max(0, import_cost - running) * annual_output
+                if borrowing and savings < borrowing * build_rate * 1.25:
+                    continue
+                if kind == self.investment_preference:
+                    score *= .96
+                candidates.append((score, kind, cost))
+            if not candidates:
+                break
+            _, kind, cost = min(candidates)
+            if cost > cash_available:
+                if p.issue_bond(cost - cash_available, self.economy, '20yr', self.credit) is None:
+                    break
+            if not p.start_construction(kind):
+                break
+
+    def operating_preview(self):
+        """Current dispatch and financing costs, without aging assets or drawing RNG."""
+        preview = Financials()
+        preview.calculate_revenue(self.grid, self.regulator, self.economy)
+        preview.calculate_operational_costs(self.player, self.game_state, self.grid, self.economy)
+        preview.ebitda = preview.total_operating_revenue - preview.operational_costs / 12
+        preview.operating_income = preview.ebitda - self.player.monthly_depreciation()
+        preview.interest_expense = sum(b.monthly_interest() for b in self.player.bonds)
+        return preview
+
+    def advance_month(self, shared_state):
+        if self.acquired:
+            return
+        p, f, state = self.player, self.financials, self.game_state
+        state.advance_turn()
+        state._real_carbon_tax = shared_state._real_carbon_tax
+        state._carbon_tax_start_turn = shared_state._carbon_tax_start_turn
+        state._carbon_tax_annual_growth = shared_state._carbon_tax_annual_growth
+        p.reset_annual_share_allowance(state.year)
+        self.ensure_liquidity()  # also repairs legacy competitors with negative cash
+        p.retire_expired_plants()
+        self.plan_portfolio()
+        p.activate_power_contract()
+        p.update_constructions()
+        self.grid.update_grid_status(p, state)
+        preview = self.operating_preview()
+        if (state.turn - self.regulator.last_request_turn >= 12
+                and self.regulator.recurring_margin(preview) < FAIRNESS_MARGIN_CAP):
+            margin = self.regulator.recurring_margin(preview)
+            requested = min(.12, max(.05, FAIRNESS_MARGIN_CAP - margin))
+            self.regulator.request_increase(p, preview, self.economy, state.turn, requested)
+            preview = self.operating_preview()
+        # No borrowing just to sustain an unaffordable dividend. A board may
+        # cut it or replace its manager, but the operating company continues.
+        recurring_profit = max(0, preview.operating_income - preview.interest_expense) * (1 - CORPORATE_TAX_RATE)
+        affordable_dividend = recurring_profit * 12 * .35 / p.shares_outstanding
+        if state.current_month in (3, 6, 9, 12):
+            due = sum(b.principal for b in p.bonds if b.months_remaining <= 1)
+            cash_after_bills = (p.cash + preview.ebitda - preview.interest_expense - due
+                                - recurring_profit * CORPORATE_TAX_RATE / (1 - CORPORATE_TAX_RATE))
+            affordable_dividend = min(affordable_dividend, max(0, cash_after_bills) * 4 / p.shares_outstanding)
+        if p.annual_dividend_per_share > affordable_dividend:
+            p.set_dividend(affordable_dividend)
+        elif state.current_month == 12 and p.annual_dividend_per_share < affordable_dividend:
+            p.set_dividend(min(affordable_dividend, max(p.annual_dividend_per_share * 1.03,
+                                                       p.stock_price * .03)))
+        f.update_player_financials(p, state, self.grid, self.economy, self.regulator,
+                                  liquidity_provider=self.ensure_liquidity)
+        self.credit.update(p, f)
+        # A competitor's board can replace its manager without deleting the company.
+        if p.fired:
+            p.fired = False
+            p.shareholder_happiness = 60
+
+
 class UtilityGameSession:
     """A small controller shared by the graphical interface and its tests."""
 
@@ -2605,11 +3009,158 @@ class UtilityGameSession:
         self.player.equity = self.player.company_value
         self.last_monthly_profit = self.financials.net_profit
         self.credit.update(self.player, self.financials)
+        self.initialize_regions()
+
+    def initialize_regions(self):
+        names = random.sample(['Cedar Coast', 'Iron Valley', 'High Plains', 'Silver Basin',
+            'Pine Ridge', 'Amber Prairie', 'Lake County', 'Redwood Reach', 'Granite Hills',
+            'Sun River', 'Blue Mesa', 'Copper Shore', 'Willow Downs', 'Snowfield'], 10)
+        sites = []
+        while len(sites) < 10:
+            candidate = (random.uniform(.06, .94), random.uniform(.06, .94))
+            if all(math.dist(candidate, site) >= .12 for site in sites):
+                sites.append(candidate)
+        polygons = region_polygons(sites)
+        self.regions = []
+        # Competitor startup messages are not management actions by the player.
+        with contextlib.redirect_stdout(io.StringIO()):
+            for index, (name, polygon, site) in enumerate(zip(names, polygons, sites)):
+                area = abs(sum(a[0] * b[1] - b[0] * a[1]
+                               for a, b in zip(polygon, polygon[1:] + polygon[:1]))) / 2
+                # The player and rivals draw from the SAME size distribution.
+                # Map area is geographical, not an extra competitor size multiplier.
+                size = (self.player.base_territory_mw if index == 0 else
+                        random.uniform(MIN_COMPANY_SIZE, MAX_COMPANY_SIZE) / 1_000_000)
+                climate = self.game_state.climate if index == 0 else random.choice(('hot', 'cold', 'temperate'))
+                operator = None if index == 0 else RegionalUtility(self.economy, size, climate, self.game_state)
+                self.regions.append(dict(id=index, name=name, utility_name=name + ' Power',
+                    site=site, polygon=polygon, area_km2=area * 500_000,
+                    climate=climate, base_mw=size, owned=index == 0, operator=operator))
+        self.player.service_territories = [dict(region_id=0, base_mw=self.player.base_territory_mw,
+            climate=self.game_state.climate, index_ratio=1.0)]
+
+    def competitor_rows(self):
+        rows = []
+        for region in self.regions:
+            if region['id'] == 0:
+                p, f, credit = self.player, self.financials, self.credit
+                demand = p.expected_demand(self.game_state)
+                name = region['utility_name'] + ' (you, consolidated)'
+            elif region['owned']:
+                rows.append(dict(region_id=region['id'], name=region['utility_name'] + ' (acquired)',
+                    market_cap=0, assets=0, liabilities=0, cash=0, net_income=0,
+                    capacity=0, demand=0, credit='Consolidated', owned=True))
+                continue
+            else:
+                company = region['operator']
+                p, f, credit = company.player, company.financials, company.credit
+                demand = p.expected_demand(company.game_state)
+                name = region['utility_name']
+            rows.append(dict(region_id=region['id'], name=name, market_cap=p.company_value,
+                assets=p.total_asset_value(), liabilities=p.total_debt(), cash=p.cash,
+                net_income=f.ttm_net_income, capacity=PowerGrid().firm_capacity(p),
+                demand=demand, credit=credit.rating, owned=region['owned']))
+        return rows
+
+    def acquisition_quote(self, region_id):
+        if isinstance(region_id, bool) or not isinstance(region_id, int):
+            raise ValueError('Choose a valid region number.')
+        region = next((r for r in self.regions if r['id'] == region_id), None)
+        if region is None or region['owned']:
+            raise ValueError('Select an independent regional utility.')
+        target = region['operator']
+        p, other = self.player, target.player
+        equity_price = max(other.company_value * (1 + TAKEOVER_PREMIUM),
+                           max(0, other.book_equity()) * 1.15)
+        fees = equity_price * ACQUISITION_FEE
+        total = equity_price + fees
+        earnings = max(0, self.financials.ttm_ebitda + target.financials.ttm_ebitda)
+        rate = self.economy.bond_rate(10, (self.credit.spread or .20) + .015)
+        tangible = p.net_utility_plant() + other.net_utility_plant()
+        combined_interest = sum(b.monthly_interest() * 12 for b in p.bonds + other.bonds)
+        # Debt and cash both increase with the dedicated facility; cash is then
+        # spent at closing. Evaluate the completed acquisition, not its proceeds.
+        post_net_debt = p.total_debt() + other.total_debt() - p.cash - other.cash + total
+        financing = min(total * ACQUISITION_FINANCE_FRACTION, tangible * .20,
+                        max(0, (earnings / 2 - combined_interest) / rate))
+        if (self.economy.in_recession or not self.credit.can_borrow
+                or post_net_debt > earnings * 6 or earnings <= 0):
+            financing = 0.0
+        return dict(region=region, price=equity_price, fees=fees, total=total,
+                    acquired_cash=other.cash, assumed_debt=other.total_debt(),
+                    financing_limit=max(0, financing), rate=rate,
+                    minimum_cash=max(0, total - financing - min(0, other.cash)))
+
+    def buy_utility(self, region_id, financing=0.0):
+        if self.game_over or self.player.fired:
+            return False
+        quote = self.acquisition_quote(region_id)
+        if (isinstance(financing, bool) or not isinstance(financing, (int, float))
+                or not math.isfinite(financing) or financing < 0
+                or financing > quote['financing_limit'] + .01):
+            raise ValueError('Acquisition financing exceeds the dedicated facility; it is unavailable in recessions.')
+        p, region = self.player, quote['region']
+        other_company = region['operator']
+        other = other_company.player
+        if p.cash + financing + min(0, quote['acquired_cash']) < quote['total']:
+            raise ValueError('Insufficient cash plus acquisition financing to close this purchase.')
+        # Validate all terms before mutating either company. Financing cannot
+        # be drawn separately, used for buybacks, or left behind after a cancel.
+        old_demand = p.expected_demand(self.game_state)
+        added_demand = other.expected_demand(other_company.game_state)
+        new_rate = (self.regulator.current_retail_price * old_demand
+                    + other_company.regulator.current_retail_price * added_demand) / max(1, old_demand + added_demand)
+        goodwill = quote['total'] - other.book_equity()
+        acquired_cash = other.cash
+        if financing:
+            p.bonds.append(Bond(financing, quote['rate'], 10, self.game_state.turn))
+            p.debt_issued_since_close += financing
+            p.acquisition_debt_issued_since_close += financing
+        p.cash += financing + acquired_cash - quote['total']
+        p.acquisition_spending_since_close += quote['total'] - acquired_cash
+        p.goodwill += other.goodwill + goodwill
+        p.retirement_credit_adjustment += other.retirement_credit_adjustment
+        p.debt += other.debt
+        p.bonds.extend(other.bonds)
+        for asset in other.plant_assets:
+            asset.asset_id = p._next_asset_id
+            p._next_asset_id += 1
+            p.plant_assets.append(asset)
+        for kind, count in other.power_plants.items():
+            p.power_plants[kind] += count
+        p.batteries.extend(other.batteries)
+        p.ongoing_constructions.extend(other.ongoing_constructions)
+        p.hydro_sites_developed += other.hydro_sites_developed
+        p.base_territory_mw += other.base_territory_mw
+        p.service_territories.append(dict(region_id=region_id, base_mw=other.base_territory_mw,
+            climate=other_company.game_state.climate,
+            index_ratio=other_company.game_state.demand_index / self.game_state.demand_index))
+        p.wholesale_commitment_mw += other.wholesale_commitment_mw
+        if p.pending_wholesale_commitment_mw is not None or other.pending_wholesale_commitment_mw is not None:
+            own_next = p.pending_wholesale_commitment_mw
+            own_next = p.wholesale_commitment_mw - other.wholesale_commitment_mw if own_next is None else own_next
+            next_other = other.pending_wholesale_commitment_mw
+            p.pending_wholesale_commitment_mw = own_next + (other.wholesale_commitment_mw if next_other is None else next_other)
+        p.acquired_ebitda_support.append(dict(monthly_ebitda=other_company.financials.ttm_ebitda / 12,
+                                             months_left=12))
+        self.regulator.current_retail_price = new_rate
+        p._sync_plant_book_values()
+        region.update(owned=True, acquired_turn=self.game_state.turn, acquisition_price=quote['total'])
+        other_company.acquired = True
+        other.cash = other.debt = other.goodwill = 0.0
+        other.bonds, other.plant_assets, other.batteries, other.ongoing_constructions = [], [], [], []
+        other.power_plants = dict.fromkeys(other.power_plants, 0)
+        other._sync_plant_book_values()
+        p.company_value = p.stock_price * p.shares_outstanding  # quote reprices at the next close
+        print(f"ACQUISITION CLOSED: {region['utility_name']} for {compact_money(quote['total'])}; "
+              f"assumed {compact_money(quote['assumed_debt'])} debt and all plants, projects, cash and customers. "
+              f"Dedicated borrowing: {compact_money(financing)}. Historical accounts remain unchanged.")
+        return True
 
     @staticmethod
     def save_classes():
         return {cls.__name__: cls for cls in (UtilityGameSession, GameState, PlayerState,
-                Economy, RateRegulator, CreditRating, Financials, PowerGrid, Bond, PlantAsset)}
+                Economy, RateRegulator, CreditRating, Financials, PowerGrid, Bond, PlantAsset, RegionalUtility)}
 
     def save_game(self, path):
         utility_persistence.save_game(self, path, self.save_classes(), GAME_VERSION)
@@ -2645,6 +3196,53 @@ class UtilityGameSession:
         for key in ('ongoing_constructions', 'batteries', 'share_trade_year', 'dividend_high_water',
                     'pending_wholesale_commitment_mw', 'monthly_borrowing_limit'):
             getattr(p, key)
+        if getattr(session, '_needs_regions', False):
+            rng = random.getstate()
+            try:
+                random.seed(f'regions:{state.turn}:{p.base_territory_mw}:{p.shares_outstanding}')
+                session.initialize_regions()
+                session._needs_regions = False
+            finally:
+                random.setstate(rng)
+        if (len(session.regions) != 10 or [r['id'] for r in session.regions] != list(range(10))
+                or not session.regions[0]['owned']
+                or economy.regime not in ('expansion', 'slowdown', 'recession', 'recovery')
+                or not math.isfinite(economy.long_rate_anchor) or economy.long_rate_anchor < 0
+                or not math.isfinite(p.goodwill) or p.goodwill < 0):
+            raise utility_persistence.SaveError('Invalid regional or economic state.')
+        for region in session.regions:
+            company = region['operator']
+            if (not isinstance(region['owned'], bool) or not math.isfinite(region['area_km2'])
+                    or region['area_km2'] <= 0 or len(region['polygon']) < 3
+                    or any(len(point) != 2 for point in region['polygon'])
+                    or any(not math.isfinite(v) or not 0 <= v <= 1
+                           for point in region['polygon'] for v in point)):
+                raise utility_persistence.SaveError('Invalid regional map.')
+            if region['id'] and (not isinstance(company, RegionalUtility)
+                                or company.economy is not economy
+                                or company.player.economy is not economy
+                                or company.game_state.economy is not economy
+                                or company.regulator.economy is not economy
+                                or not math.isfinite(company.player.cash)
+                                or company.acquired != region['owned']):
+                raise utility_persistence.SaveError('Invalid regional operator.')
+        if {area['region_id'] for area in p.service_territories} != {r['id'] for r in session.regions if r['owned']}:
+            raise utility_persistence.SaveError('Customer territories do not match regional ownership.')
+        players = [p] + [r['operator'].player for r in session.regions[1:]]
+        for owner in players:
+            if any(not isinstance(a, PlantAsset) or a.plant_type not in PLANT_OPERATING_LIFE_YEARS
+                   or type(a.months_in_service) is not int or a.months_in_service < 0
+                   or type(a.operating_life_months) is not int or a.operating_life_months <= 0
+                   for a in owner.plant_assets):
+                raise utility_persistence.SaveError('Invalid plant service-life register.')
+        for region in session.regions[1:]:
+            company = region['operator']
+            if getattr(company, '_needs_liquidity_repair', False):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    company.ensure_liquidity()
+                company._needs_liquidity_repair = False
+            if company.player.cash < 0:
+                raise utility_persistence.SaveError('A regional utility is missing its cash-shortfall financing.')
 
     def advance_month(self):
         """Resolve one month after the player has finished making decisions."""
@@ -2657,9 +3255,14 @@ class UtilityGameSession:
         state = self.game_state
         self.economy.update()
         state.advance_turn()
+        with contextlib.redirect_stdout(io.StringIO()):
+            for region in self.regions:
+                if not region['owned']:
+                    region['operator'].advance_month(state)
         self.player.reset_annual_share_allowance(state.year)
         self.player.activate_power_contract()
         self.player.update_constructions()
+        self.player.retire_expired_plants()
         self.grid.update_grid_status(self.player, state)
         self.financials.update_player_financials(
             self.player, state, self.grid, self.economy, self.regulator
@@ -2733,6 +3336,7 @@ class UtilityGameGUI:
         self.root.bind('<Command-s>', lambda _event: self.save_game())
         self.root.bind('<Control-s>', lambda _event: self.save_game())
         self.root.bind('<Command-o>', lambda _event: self.load_game())
+        self.root.bind('<Control-o>', lambda _event: self.load_game())
         self.root.after(140, self._animate_flow)
 
     def _configure_styles(self):
@@ -2915,12 +3519,13 @@ class UtilityGameGUI:
             ("Financial", self.open_financial_menu),
             ("Issue bond", self.issue_bond),
             ("Rate case", self.request_rate_case),
-            ("Trade power", self.trade_power),
+            ("Buy power", self.trade_power),
             ("Dividend", self.set_dividend),
             ("Battery mode", self.toggle_battery_mode),
             ("Emergency loan", self.emergency_loan),
             ("Forecast", self.open_demand_forecast),
             ("Stock trades", self.open_equity_menu),
+            ("View map", self.open_region_map),
             ("Help", self.show_help),
         ]
         management_start = math.ceil(len(GUI_BUILD_INFO) / action_columns) + 1
@@ -3028,8 +3633,7 @@ class UtilityGameGUI:
             self.COLORS['amber'] if reserve < TARGET_RESERVE_MARGIN else self.COLORS['green'])
         self.cards['reserve'].configure(fg=reserve_color)
 
-        mood = ("Boom" if session.economy.sentiment > 0.4 else
-                "Recession" if session.economy.sentiment < -0.4 else "Stable")
+        mood = session.economy.regime.title()
         mode = "battery first" if player.battery_dispatch_mode == 'before_gas' else "gas first"
         carbon = (f"${state.carbon_tax:.2f}/t" if state.carbon_tax > 0 else "not enacted")
         self.conditions_label.configure(text=(
@@ -3092,10 +3696,17 @@ class UtilityGameGUI:
 
         self._draw_scene()
         self._draw_chart()
+        for window in self.root.winfo_children():
+            if isinstance(window, tk.Toplevel) and hasattr(window, 'refresh_regions'):
+                window.refresh_regions()
         if session.game_over:
             self.next_button.configure(state='disabled', text='GAME COMPLETE')
             for button in self.action_buttons:
                 button.configure(state='disabled')
+        else:
+            self.next_button.configure(state='normal', text='ADVANCE MONTH  →')
+            for button in self.action_buttons:
+                button.configure(state='normal')
 
     def _draw_scene(self):
         canvas = self.scene
@@ -3154,8 +3765,7 @@ class UtilityGameGUI:
         top_text = (f"Produced {grid.total_generation:,.0f} / max {grid.maximum_generation:,.0f} MW\n"
                     f"For customers: {grid.available_for_customers:,.0f} MW   "
                     f"Demand: {grid.total_demand:,.0f} MW\n"
-                    f"Contract: +{grid.contract_imports_mw:,.0f} MW in / "
-                    f"−{grid.contract_exports_mw:,.0f} MW out")
+                    f"Purchases: +{grid.contract_imports_mw:,.0f} MW; surplus is curtailed")
         canvas.create_text(14, 13, anchor='nw', text=top_text,
                            fill='#e9f4fb', font=('Helvetica', 11, 'bold'))
         balance = grid.current_surplus_deficit
@@ -3372,7 +3982,7 @@ class UtilityGameGUI:
 
     def save_game(self):
         path = filedialog.asksaveasfilename(parent=self.root, title='Save Gridline game',
-            defaultextension='.gridline.json', initialfile='utility-v2.gridline.json',
+            defaultextension='.gridline.json', initialfile='utility-v3.gridline.json',
             filetypes=[('Gridline save', '*.gridline.json'), ('JSON', '*.json')])
         if not path:
             return
@@ -3408,6 +4018,155 @@ class UtilityGameGUI:
         self.log.configure(state='disabled')
         self._append_log('Saved game loaded; simulation state and future random events restored.')
         self.refresh()
+
+    def open_region_map(self):
+        window = tk.Toplevel(self.root)
+        window.title('Regional utility map')
+        window.configure(bg=self.COLORS['background'])
+        window.geometry('1050x730')
+        window.minsize(800, 600)
+        tk.Label(window, text='THE TEN REGIONS', bg=self.COLORS['background'],
+                 fg=self.COLORS['text'], font=('Helvetica', 18, 'bold')).pack(anchor='w', padx=20, pady=(15, 5))
+        tk.Label(window, text='Green = your territory • Blue = independent utility • Click a region for company details',
+                 bg=self.COLORS['background'], fg=self.COLORS['muted']).pack(anchor='w', padx=20)
+        canvas = tk.Canvas(window, bg=self.COLORS['panel'], highlightthickness=0)
+        canvas.pack(fill='both', expand=True, padx=20, pady=15)
+        window.region_canvas = canvas
+
+        def draw(_event=None):
+            canvas.delete('all')
+            width, height = max(500, canvas.winfo_width()) - 30, max(350, canvas.winfo_height()) - 30
+            for region in self.session.regions:
+                color = '#246951' if region['owned'] else '#203d65'
+                points = [coordinate for x, y in region['polygon'] for coordinate in (15 + x * width, 15 + y * height)]
+                tag = f"region_{region['id']}"
+                canvas.create_polygon(*points, fill=color, outline=self.COLORS['cyan'], width=2, tags=tag)
+                x, y = region['site']
+                label_width = max(70, min(160, width * .65 *
+                    (max(x for x, _ in region['polygon']) - min(x for x, _ in region['polygon']))))
+                canvas.create_text(15 + x * width, 15 + y * height,
+                    text=f"{region['id'] + 1}. {region['name']}\n{region['area_km2']:,.0f} km²\n"
+                         + ('YOUR UTILITY' if region['owned'] else 'Independent utility'),
+                    fill=self.COLORS['text'], width=label_width,
+                    font=('Helvetica', 9, 'bold'), tags=tag)
+                canvas.tag_bind(tag, '<Button-1>', lambda _event, rid=region['id']: self.open_competitors(rid))
+                canvas.tag_bind(tag, '<Enter>', lambda _event: canvas.configure(cursor='hand2'))
+                canvas.tag_bind(tag, '<Leave>', lambda _event: canvas.configure(cursor=''))
+        canvas.bind('<Configure>', draw)
+        window.refresh_regions = draw
+        draw()
+
+    def open_competitors(self, selected_region=None):
+        window = tk.Toplevel(self.root)
+        window.title('Competitors and acquisitions')
+        window.configure(bg=self.COLORS['background'])
+        window.geometry('1260x730')
+        window.minsize(880, 600)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        summary = tk.Label(window, bg=self.COLORS['background'], fg=self.COLORS['text'],
+                           font=('Helvetica', 12, 'bold'), justify='left', padx=18, pady=16)
+        summary.grid(row=0, column=0, sticky='ew')
+        frame = tk.Frame(window, bg=self.COLORS['panel'])
+        frame.grid(row=1, column=0, sticky='nsew', padx=18)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        specs = [('name', 'UTILITY', 245), ('market_cap', 'MARKET CAP', 110), ('assets', 'ASSETS', 110),
+                 ('liabilities', 'LIABILITIES', 110), ('cash', 'CASH', 100), ('net_income', 'TTM PROFIT', 110),
+                 ('capacity', 'FIRM MW', 85), ('demand', 'DEMAND MW', 95), ('credit', 'CREDIT', 105)]
+        table = ttk.Treeview(frame, columns=[s[0] for s in specs], show='headings', style='Utility.Treeview')
+        for key, title, width in specs:
+            table.heading(key, text=title)
+            table.column(key, width=width, minwidth=width, stretch=False, anchor='w' if key == 'name' else 'e')
+        table.grid(row=0, column=0, sticky='nsew')
+        for orient, row, column, sticky, command in (
+                ('horizontal', 1, 0, 'ew', table.xview), ('vertical', 0, 1, 'ns', table.yview)):
+            scroll = ttk.Scrollbar(frame, orient=orient, command=command)
+            scroll.grid(row=row, column=column, sticky=sticky)
+            table.configure(**{('xscrollcommand' if orient == 'horizontal' else 'yscrollcommand'): scroll.set})
+        table.tag_configure('player', foreground=self.COLORS['green'])
+        window.region_table = table
+        details = tk.Label(window, bg=self.COLORS['panel'], fg=self.COLORS['text'], justify='left',
+                           anchor='nw', wraplength=1150, padx=18, pady=12)
+        details.grid(row=2, column=0, sticky='ew', padx=18, pady=10)
+        window.bind('<Configure>', lambda event: details.configure(
+            wraplength=max(500, window.winfo_width() - 75)) if event.widget is window else None)
+
+        def show_details(_event=None):
+            if not table.selection():
+                details.configure(text='Select a utility to examine its fleet and acquisition terms.')
+                return
+            rid = int(table.selection()[0])
+            region = self.session.regions[rid]
+            if region['owned']:
+                details.configure(text=f"{region['name']}: owned by you. Its assets and customers are included in your consolidated company.")
+                return
+            quote = self.session.acquisition_quote(rid)
+            company = region['operator']
+            fleet = ', '.join(f'{kind.replace("_", " ")} ×{count}' for kind, count in company.player.power_plants.items() if count)
+            support_debt = sum(b.principal for b in company.player.bonds
+                               if getattr(b, 'purpose', '') == 'regional_liquidity')
+            details.configure(text=f"{region['name']} • {region['area_km2']:,.0f} km² • {region['climate']} climate\n"
+                f"Fleet: {fleet}; batteries ×{len(company.player.batteries)}; projects {len(company.player.ongoing_constructions)}.\n"
+                f"Continuity loans included in debt: {compact_money(support_debt)}. These fund cash shortfalls, not free cash or new plants.\n"
+                f"Equity purchase: {compact_money(quote['price'])} (at least 40% above market cap and 15% above book equity). "
+                f"Closing costs: {compact_money(quote['fees'])}. Debt assumed: {compact_money(quote['assumed_debt'])}.\n"
+                f"Total closing cash: {compact_money(quote['total'])}; cash inherited afterwards: {compact_money(quote['acquired_cash'])}.\n"
+                f"Dedicated 10-year financing available: {compact_money(quote['financing_limit'])} at {quote['rate']:.2%}. "
+                'This is outside the ordinary monthly cap, restricted to closing, and unavailable during recessions.')
+
+        def refresh_rows():
+            selected = table.selection()
+            rows = self.session.competitor_rows()
+            rank = 1 + sum(row['market_cap'] > self.session.player.company_value for row in rows[1:] if not row['owned'])
+            independent = 1 + sum(not r['owned'] for r in self.session.regions)
+            summary.configure(text=f'You rank {rank} of {independent} independent utilities by market cap. '
+                f'You own {sum(r["owned"] for r in self.session.regions)} of 10 regions.\n'
+                f'{self.session.economy.regime.title()} • Ordinary credit availability {self.session.economy.credit_multiplier:.0%} • '
+                'Competitor investment, earnings, financing and valuation update monthly.')
+            for row in rows:
+                values = [row['name']] + [compact_money(row[key]) for key in ('market_cap', 'assets', 'liabilities', 'cash', 'net_income')]
+                values += [f"{row['capacity']:,.0f}", f"{row['demand']:,.0f}", row['credit']]
+                iid = str(row['region_id'])
+                if table.exists(iid):
+                    table.item(iid, values=values, tags=('player',) if row['owned'] else ())
+                else:
+                    table.insert('', 'end', iid=iid, values=values, tags=('player',) if row['owned'] else ())
+            if selected:
+                table.selection_set(selected)
+            show_details()
+
+        def buy_selected():
+            if not table.selection():
+                return
+            rid = int(table.selection()[0])
+            if self.session.regions[rid]['owned']:
+                return
+            quote = self.session.acquisition_quote(rid)
+            financing = simpledialog.askfloat('Acquisition financing',
+                f"Total payment: {compact_money(quote['total'])}; your cash: {compact_money(self.session.player.cash)}.\n"
+                f"Dedicated borrowing in $ millions (0 = all cash). Maximum {quote['financing_limit'] / 1e6:,.2f}M.\n"
+                'Existing target debt is assumed in addition to this new borrowing.', minvalue=0,
+                maxvalue=quote['financing_limit'] / 1e6, parent=window)
+            if financing is None:
+                return
+            if messagebox.askyesno('Confirm acquisition',
+                    f"Buy {quote['region']['utility_name']} for {compact_money(quote['total'])}, "
+                    f"borrow {compact_money(financing * 1e6)} and assume {compact_money(quote['assumed_debt'])} of debt?",
+                    parent=window):
+                self._run_action(lambda: self.session.buy_utility(rid, financing * 1e6))
+                refresh_rows()
+
+        controls = tk.Frame(window, bg=self.COLORS['background'], padx=18, pady=12)
+        controls.grid(row=3, column=0, sticky='ew')
+        self._clickable_label(controls, 'BUY SELECTED UTILITY', buy_selected, self.COLORS['blue']).pack(side='left')
+        self._clickable_label(controls, 'VIEW MAP', self.open_region_map, self.COLORS['panel_alt']).pack(side='left', padx=10)
+        self._clickable_label(controls, 'CLOSE', window.destroy, self.COLORS['panel_alt']).pack(side='right')
+        table.bind('<<TreeviewSelect>>', show_details)
+        window.refresh_regions = refresh_rows
+        refresh_rows()
+        table.selection_set(str(0 if selected_region is None else selected_region))
+        show_details()
 
     def open_equity_menu(self):
         window = tk.Toplevel(self.root)
@@ -3606,8 +4365,17 @@ class UtilityGameGUI:
         if not projects:
             table.insert('', 'end', values=('', 'No active projects', '', '', '', '', ''))
 
+        expiring = sorted((a for a in self.session.player.plant_assets if a.remaining_life_months <= 84),
+                          key=lambda a: a.remaining_life_months)
+        age_note = ('Upcoming service retirements: ' + '; '.join(
+            f'{a.plant_type.replace("_", " ")} #{a.asset_id} in {a.remaining_life_months} months'
+            for a in expiring[:4]) + (f'; plus {len(expiring) - 4} more' if len(expiring) > 4 else '')
+            if expiring else 'No plants reach their service limit in the next seven years.')
+        tk.Label(window, text=age_note + '\nFull service lives and remaining months are in Financials → Balance sheet → Plant details.',
+                 bg=self.COLORS['background'], fg=self.COLORS['amber'] if expiring else self.COLORS['muted'],
+                 justify='left', anchor='w', wraplength=820, padx=20, pady=10).grid(row=3, column=0, sticky='ew')
         controls = tk.Frame(window, bg=self.COLORS['background'], padx=20, pady=12)
-        controls.grid(row=3, column=0, sticky='ew')
+        controls.grid(row=4, column=0, sticky='ew')
         refresh = self._clickable_label(
             controls, "REFRESH",
             lambda: (window.destroy(), self.open_construction_menu()),
@@ -3754,6 +4522,8 @@ class UtilityGameGUI:
             self.COLORS['panel_alt']
         )
         dividend.pack(side='left')
+        self._clickable_label(controls, 'COMPETITORS / BUYOUTS', self.open_competitors,
+                              self.COLORS['blue']).pack(side='left', padx=8)
         close = self._clickable_label(
             controls, "CLOSE", window.destroy, self.COLORS['panel_alt']
         )
@@ -3795,12 +4565,12 @@ class UtilityGameGUI:
             f"Cash  {compact_money(player.cash)}     Total debt  {compact_money(total_debt)}     "
             f"Debt / book equity  {debt_to_book}     Credit  {credit.rating}\n"
             f"Net debt (bonds − cash)  {compact_money(net_debt)}     "
-            f"Net debt / book equity  {net_leverage}     "
+            f"Net debt / book equity  {net_leverage} (credit excludes retirement write-offs)     "
             f"TTM EBITDA / interest  {credit.interest_coverage:.2f}×\n"
-            f"Borrowing this month  {compact_money(player.debt_issued_since_close)} / "
-            f"{compact_money(player.monthly_borrowing_limit)}     "
+            f"Ordinary borrowing  {compact_money(player.debt_issued_since_close - player.acquisition_debt_issued_since_close)} / "
+            f"{compact_money(player.effective_borrowing_limit())}     "
             f"Remaining  {compact_money(player.remaining_borrowing_capacity())}     "
-            f"Cap: {MONTHLY_BORROWING_ASSET_FRACTION:.0%} of opening non-cash assets\n"
+            f"Credit availability: {economy.credit_multiplier:.0%} of normal\n"
             f"Stock  ${player.stock_price:,.2f}     Market cap  {compact_money(player.company_value)}     "
             f"Dividend  ${player.annual_dividend_per_share:.3f}/share     Yield  {dividend_yield:.2f}%\n"
             f"TTM EPS  ${financials.ttm_eps(player.shares_outstanding):.3f}     "
@@ -3810,7 +4580,8 @@ class UtilityGameGUI:
             f"Price / book  {pb_text}     Book valuation benchmark  {UTILITY_TARGET_PRICE_TO_BOOK:.2f}×\n"
             f"Annual interest  {compact_money(annual_interest)}     Weighted coupon  {weighted_coupon:.2f}%     "
             f"Debt market value  {compact_money(debt_market_value)}\n"
-            f"Base rate  {economy.interest_rate * 100:.2f}%     "
+            f"{economy.regime.title()}  |  Base rate  {economy.interest_rate * 100:.2f}%     "
+            f"Long-rate memory {economy.long_rate_anchor:.2%}     "
             f"Carbon cost/month  {compact_money(financials.carbon_costs / 12)}     "
             f"Price index  {economy.price_index * 100:.2f} (start 100)\n"
             f"Recurring power: {power_contract_description(player.wholesale_commitment_mw)}"
@@ -3928,6 +4699,7 @@ class UtilityGameGUI:
                 ('Accumulated depreciation', -player.accumulated_depreciation(), 'normal'),
                 ('Net utility plant', player.net_utility_plant(), 'total'),
                 ('Construction work in progress', player.construction_work_in_progress(), 'normal'),
+                ('Acquisition goodwill', player.goodwill, 'normal'),
                 ('Total assets', player.total_asset_value(), 'grand'),
                 ('LIABILITIES', None, 'section'),
                 ('Current portion of debt', current_debt, 'normal'),
@@ -3957,6 +4729,7 @@ class UtilityGameGUI:
                 ('INVESTING ACTIVITIES', None, 'section'),
                 ('Capital expenditures', -financials.capital_expenditures, 'normal'),
                 ('Asset retirement proceeds', financials.asset_sale_proceeds, 'normal'),
+                ('Acquisitions, net of cash acquired', -financials.acquisition_spending, 'normal'),
                 ('Net cash from investing', financials.net_cash_from_investing, 'total'),
                 ('FINANCING ACTIVITIES', None, 'section'),
                 ('Debt issued', financials.debt_issuance, 'normal'),
@@ -4255,12 +5028,12 @@ class UtilityGameGUI:
                 f"{row['reserve_margin']:+.1%}",
             ))
         note_label = tk.Label(
-            window, text='Demand includes seasonal patterns, normal 2% annual growth, and '
+            window, text='Demand includes all acquired regions, seasonal patterns, 2% annual growth adjusted for current sentiment, and '
             'remaining effects of known demand events. The shaded ±10% range represents '
             'normal monthly variation, not a confidence interval; unforeseen events can exceed it. '
             'Dependable supply includes peakers, capacity credits for renewables/storage, '
-            'scheduled construction completions, and next-month power contracts (imports minus '
-            'exports). It assumes no new project delays or battery degradation. '
+            'scheduled construction completions, and next-month power purchases. '
+            'It assumes the current sentiment persists, with no new project delays or battery degradation. '
             'Amber: less than 15% reserve. Red: insufficient supply for high demand.',
             bg=self.COLORS['background'], fg=self.COLORS['muted'],
             font=('Helvetica', 9), wraplength=940, justify='left', padx=20, pady=12
@@ -4316,11 +5089,12 @@ class UtilityGameGUI:
         tk.Label(parent, text=totals, bg=self.COLORS['panel'], fg=self.COLORS['text'],
                  font=('Helvetica', 10, 'bold'), padx=10, pady=12,
                  wraplength=980, justify='left').grid(row=0, column=0, sticky='w')
-        columns = ('id', 'type', 'mw', 'age', 'life', 'cost', 'monthly', 'accumulated', 'net')
+        columns = ('id', 'type', 'mw', 'age', 'life', 'service', 'remaining', 'cost', 'monthly', 'accumulated', 'net')
         table = ttk.Treeview(parent, columns=columns, show='headings', style='Utility.Treeview')
         specs = (
             ('id', 'UNIT', 65), ('type', 'TYPE', 85), ('mw', 'MW', 60),
-            ('age', 'AGE (MO)', 85), ('life', 'LIFE (YR)', 80),
+            ('age', 'AGE (MO)', 85), ('life', 'DEPR. LIFE (YR)', 115),
+            ('service', 'SERVICE LIMIT (YR)', 140), ('remaining', 'MONTHS LEFT', 115),
             ('cost', 'ORIGINAL COST', 155), ('monthly', 'MONTHLY DEP.', 135),
             ('accumulated', 'TOTAL DEP.', 155), ('net', 'NET BOOK VALUE', 155),
         )
@@ -4338,7 +5112,8 @@ class UtilityGameGUI:
             table.insert('', 'end', values=(
                 f'#{asset.asset_id:03d}', GUI_BUILD_INFO[asset.plant_type][0],
                 f'{PLANT_NAMEPLATE_CAPACITY[asset.plant_type]:,}', asset.months_in_service,
-                ASSET_USEFUL_LIFE_YEARS[asset.plant_type], f'${asset.original_cost:,.0f}',
+                ASSET_USEFUL_LIFE_YEARS[asset.plant_type], asset.operating_life_months // 12,
+                asset.remaining_life_months, f'${asset.original_cost:,.0f}',
                 f'${asset.monthly_depreciation:,.0f}', f'${asset.accumulated_depreciation:,.0f}',
                 f'${asset.net_book_value:,.0f}',
             ))
@@ -4349,7 +5124,9 @@ class UtilityGameGUI:
             'pre-game service: inherited plants start 20–65% through their useful lives, with '
             'that depreciation already recorded. Newly built plants start at age zero. '
             'Projects under construction do not '
-            'depreciate until completion. Retiring units removes the newest units of that type first.',
+            'depreciate until completion. Physical service limits are separate from depreciation: '
+            'plants stop working and retire automatically at their limit. Manual retirement removes '
+            'the newest units of that type first; automatic retirement removes only expired units.',
             bg=self.COLORS['panel'], fg=self.COLORS['muted'], font=('Helvetica', 9),
             justify='left', wraplength=950, padx=10, pady=12
         )
@@ -4427,8 +5204,9 @@ class UtilityGameGUI:
     def request_rate_case(self):
         percent = simpledialog.askfloat(
             "Request rate increase",
-            "Retail tariffs already track inflation automatically.\n"
-            "Requested additional increase (%):", minvalue=0.1,
+            f"Current recurring margin: {self.session.regulator.recurring_margin(self.session.financials):.1%}.\n"
+            "Rates do not increase automatically. Below 12% margin qualifies for review.\n"
+            "Requested increase (%):", minvalue=0.1,
             maxvalue=50, parent=self.root
         )
         if percent is not None:
@@ -4440,32 +5218,21 @@ class UtilityGameGUI:
     def trade_power(self):
         player = self.session.player
         pending = player.pending_wholesale_commitment_mw
-        direction = simpledialog.askstring(
+        market = wholesale_market_price(self.session.economy)
+        factor = CONTRACT_BUY_FACTOR
+        mw = simpledialog.askfloat(
             "Recurring wholesale power",
             f"Active: {power_contract_description(player.wholesale_commitment_mw)}\n"
             + (f"Scheduled: {power_contract_description(pending)}\n" if pending is not None else '')
-            + "Type BUY or SELL. This sets the TOTAL recurring amount from next month.",
-            parent=self.root
-        )
-        if direction is None:
-            return
-        direction = direction.strip().lower()
-        if direction not in ('buy', 'sell'):
-            messagebox.showerror("Invalid trade", "Enter BUY or SELL.", parent=self.root)
-            return
-        market = wholesale_market_price(self.session.economy)
-        factor = CONTRACT_BUY_FACTOR if direction == 'buy' else CONTRACT_SELL_FACTOR
-        mw = simpledialog.askfloat(
-            "Recurring wholesale power",
-            f"{direction.upper()} how many MW each month? Enter 0 to cancel.\n"
+            + "BUY how many MW each month? Enter 0 to cancel.\n"
             f"Current estimate: ${market * factor:.2f}/MWh × {HOURS_PER_MONTH:.0f} hours/month.\n"
-            "Prices change with the market. Exports use generation; any shortage is\n"
-            "bought on the spot market at a premium. No cash moves until next month.",
+            "Selling power is disabled. Residual shortages are bought at a spot premium.\n"
+            "No cash moves until next month; surplus power is curtailed.",
             minvalue=0, parent=self.root
         )
         if mw is not None:
             self._run_action(lambda: self.session.player.wholesale_trade(
-                mw, direction, self.session.economy
+                mw, 'buy', self.session.economy
             ))
 
     def set_dividend(self):
@@ -4553,9 +5320,9 @@ class UtilityGameGUI:
             "interest rates, debt, carbon policy, and construction lead times. Hydro gets "
             "more expensive as the best river sites are used.\n\n"
             "Inflation compounds monthly into the price index (opening = 100). New plants, "
-            "fuel/O&M, wholesale buys and sales, retail tariffs, carbon charges, salvage, "
+            "fuel/O&M, wholesale purchases, carbon charges, salvage, "
             "and teardown all follow it. Gas shocks and carbon-policy escalation apply on top. "
-            "Rate cases request increases above automatic inflation adjustments. Prepaid "
+            "Retail tariffs stay fixed until you manually win a rate case with a recurring margin below 12%. Prepaid "
             "construction stays fixed; new overrun work uses current prices. Historical plant "
             "costs/depreciation, cash, existing bond principal/coupons, and declared dividends "
             "are not automatically marked up.\n\n"
@@ -4563,7 +5330,7 @@ class UtilityGameGUI:
             "Use Financial to review dividends, open the three accounting statements, and buy "
             "bonds back at their current market value. Hover over statement terms for definitions. "
             f"Borrowing is capped at {MONTHLY_BORROWING_ASSET_FRACTION:.0%} of plant and "
-            "construction book value each month, including emergency loans. Credit uses "
+            "construction book value each month, including emergency loans; recessions halve this limit. Credit uses "
             "net debt (bonds minus cash) relative to book equity and trailing-12-month EBITDA "
             "coverage of current annual interest (opening earnings estimates roll off monthly). "
             "AAA requires a 95/100 score plus at least 12 strong months with net leverage ≤0.35× "
@@ -4577,7 +5344,9 @@ class UtilityGameGUI:
             'Statements offer the last four complete calendar quarters or years, with estimated '
             'pre-game data labeled. Solar/wind real build costs decline over the first ten years. '
             "Power trades are recurring MW commitments, replaced starting next month when "
-            "you change them; enter 0 to cancel. Sold power leaves your grid. "
+            "you change them; enter 0 to cancel. Power sales are disabled; surplus is curtailed. "
+            "View map shows ten regions. Financial → Competitors / Buyouts compares utilities. "
+            "Acquisitions cost a premium, assume all debt and assets, and can use dedicated financing outside recessions. "
             "Balance sheet → Plant details lists every unit's cost and depreciation. "
             "Income statement → Operating costs by plant breaks out fuel/O&M, carbon, "
             "purchased power, and depreciation. The income statement also shows TTM EPS: "

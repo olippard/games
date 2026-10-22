@@ -87,7 +87,7 @@ class VersionTwoTests(unittest.TestCase):
         self.p.shareholder_happiness = 48
         self.p.months_without_raise = 11
         self.p.trade_shares('issue', 1000, self.s.game_state)
-        self.p.wholesale_trade(75, 'sell', self.s.economy)
+        self.p.wholesale_trade(75, 'buy', self.s.economy)
         self.s.save_game(self.path)
         before = saves.encode_graph(self.s, self.s.save_classes())
         loaded = utility.UtilityGameSession.load_game(self.path)
@@ -313,10 +313,10 @@ class VersionTwoTests(unittest.TestCase):
             if e.last_technology_event:
                 news.append(month)
         self.assertEqual(news, list(range(12, 121, 12)))
-        self.assertAlmostEqual(self.p.construction_cost('solar'), 330_000_000)
-        self.assertAlmostEqual(self.p.construction_cost('wind'), 275_000_000)
+        self.assertAlmostEqual(self.p.construction_cost('solar'), 660_000_000)
+        self.assertAlmostEqual(self.p.construction_cost('wind'), 550_000_000)
         e.price_index = 1.5
-        self.assertAlmostEqual(self.p.construction_cost('solar'), 495_000_000)
+        self.assertAlmostEqual(self.p.construction_cost('solar'), 990_000_000)
 
 
 if __name__ == '__main__':

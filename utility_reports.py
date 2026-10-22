@@ -36,6 +36,7 @@ CASH_LINES = (
     ('Net cash from operations', 'net_cash_from_operations', 1),
     ('Capital expenditures', 'capital_expenditures', -1),
     ('Asset retirement proceeds', 'asset_sale_proceeds', 1),
+    ('Acquisitions, net of cash acquired', 'acquisition_spending', -1),
     ('Net cash from investing', 'net_cash_from_investing', 1),
     ('Debt issued', 'debt_issuance', 1),
     ('Debt repaid or repurchased', 'debt_repayments', -1),
@@ -55,6 +56,7 @@ BALANCE_LINES = (
     ('Accumulated depreciation', 'accumulated_depreciation', -1),
     ('Net utility plant', 'net_plant', 1),
     ('Construction work in progress', 'construction', 1),
+    ('Acquisition goodwill', 'goodwill', 1),
     ('Total assets', 'assets', 1),
     ('Current portion of debt', 'current_debt', 1),
     ('Long-term debt', 'long_term_debt', 1),
@@ -73,7 +75,7 @@ def balance_snapshot(player):
     return dict(cash=player.cash, gross_plant=player.gross_utility_plant(),
                 accumulated_depreciation=player.accumulated_depreciation(),
                 net_plant=player.net_utility_plant(), construction=player.construction_work_in_progress(),
-                assets=player.total_asset_value(), current_debt=current,
+                goodwill=player.goodwill, assets=player.total_asset_value(), current_debt=current,
                 long_term_debt=player.total_debt() - current, debt=player.total_debt(),
                 paid_in_capital=player.paid_in_capital, treasury_stock=player.treasury_stock,
                 retained_earnings=equity - player.paid_in_capital + player.treasury_stock,
@@ -99,7 +101,7 @@ def store_close(financials, player, state):
 
 def _recompute_balance(balance):
     balance['net_plant'] = balance['gross_plant'] - balance['accumulated_depreciation']
-    balance['assets'] = balance['cash'] + balance['net_plant'] + balance['construction']
+    balance['assets'] = balance['cash'] + balance['net_plant'] + balance['construction'] + balance['goodwill']
     balance['equity'] = balance['assets'] - balance['debt']
     balance['retained_earnings'] = (balance['equity'] - balance['paid_in_capital']
                                   + balance['treasury_stock'])

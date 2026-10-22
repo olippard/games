@@ -43,7 +43,7 @@ class OperationsTests(unittest.TestCase):
     def test_contract_edits_replace_pending_amount_without_cash_or_grid_changes(self):
         p = self.player
         before = p.cash, self.session.grid.total_generation
-        self.assertTrue(p.wholesale_trade(100, 'sell', self.session.economy))
+        self.assertFalse(p.wholesale_trade(100, 'sell', self.session.economy))
         self.assertTrue(p.wholesale_trade(200, 'buy', self.session.economy))
         self.assertEqual(p.wholesale_commitment_mw, 0)
         self.assertEqual(p.pending_wholesale_commitment_mw, 200)
@@ -54,20 +54,20 @@ class OperationsTests(unittest.TestCase):
 
     def test_contract_recurs_and_cancellation_only_applies_next_month(self):
         p = self.player
-        p.wholesale_trade(100, 'sell', self.session.economy)
+        p.wholesale_trade(100, 'buy', self.session.economy)
         for _ in range(2):
             self.session.advance_month()
-            self.assertEqual(self.session.grid.contract_exports_mw, 100)
+            self.assertEqual(self.session.grid.contract_imports_mw, 100)
             f = self.session.financials
             expected = (100 * utility.HOURS_PER_MONTH
                         * utility.wholesale_market_price(self.session.economy)
-                        * utility.CONTRACT_SELL_FACTOR)
-            self.assertAlmostEqual(f.contract_sales_revenue, expected)
+                        * utility.CONTRACT_BUY_FACTOR)
+            self.assertAlmostEqual(f.contract_purchase_cost, expected)
             self.assertAlmostEqual(f.ending_cash - f.beginning_cash,
                                    f.net_cash_from_operations + f.net_cash_from_investing
                                    + f.net_cash_from_financing, delta=0.01)
-        p.wholesale_trade(0, 'sell', self.session.economy)
-        self.assertEqual(p.wholesale_commitment_mw, -100)
+        p.wholesale_trade(0, 'buy', self.session.economy)
+        self.assertEqual(p.wholesale_commitment_mw, 100)
         self.session.advance_month()
         self.assertEqual(p.wholesale_commitment_mw, 0)
         self.assertEqual(self.session.financials.contract_sales_revenue, 0)
@@ -80,33 +80,33 @@ class OperationsTests(unittest.TestCase):
             self.assertFalse(p.wholesale_trade(amount, direction, self.session.economy))
             self.assertEqual(p.pending_wholesale_commitment_mw, 100)
 
-    def test_exports_dispatch_peakers_and_imports_displace_them(self):
+    def test_exports_are_ignored_and_imports_displace_peakers(self):
         ordinary, exporting, importing = self.dispatch(), self.dispatch(-300), self.dispatch(200)
         self.assertEqual(ordinary.gas_generation, 200)
-        self.assertEqual(exporting.gas_generation, 500)
+        self.assertEqual(exporting.gas_generation, 200)
         self.assertEqual(importing.gas_generation, 0)
         for grid in (ordinary, exporting, importing):
             self.assertEqual(grid.available_for_customers, 800)
             self.assertEqual(grid.current_surplus_deficit, 0)
             self.assertLessEqual(grid.total_generation, grid.maximum_generation)
 
-    def test_exports_reduce_surplus_and_are_not_sold_twice(self):
+    def test_surplus_is_curtailed_and_sales_have_no_revenue(self):
         grid = self.dispatch(-100, demand=200)
         self.assertEqual(grid.total_generation, 600)
-        self.assertEqual(grid.available_for_customers, 500)
-        self.assertEqual(grid.spot_exports_mw, 300)
+        self.assertEqual(grid.available_for_customers, 600)
+        self.assertEqual(grid.spot_exports_mw, 0)
         f = self.settlement(grid)
-        self.assertEqual(f.contract_sales_revenue, 100 * 730 * 40 * 0.95)
-        self.assertEqual(f.spot_sales_revenue, 300 * 730 * 40 * 0.85)
+        self.assertEqual(f.contract_sales_revenue, 0)
+        self.assertEqual(f.spot_sales_revenue, 0)
         self.assertEqual(f.purchased_power_costs, 0)
 
-    def test_unsupported_exports_must_be_purchased_at_a_loss(self):
+    def test_stale_export_contracts_cannot_create_imports_or_revenue(self):
         large, larger = self.dispatch(-2000), self.dispatch(-3000)
-        self.assertEqual(large.spot_imports_mw, 1200)
+        self.assertEqual(large.spot_imports_mw, 0)
         f1, f2 = self.settlement(large), self.settlement(larger)
         net1 = f1.total_operating_revenue - f1.purchased_power_costs / 12
         net2 = f2.total_operating_revenue - f2.purchased_power_costs / 12
-        self.assertLess(net2, net1)
+        self.assertEqual(net2, net1)
 
     def test_excess_imports_cannot_be_resold_for_a_free_profit(self):
         f1 = self.settlement(self.dispatch(1000))

@@ -135,11 +135,11 @@ class CreditBalanceTests(unittest.TestCase):
         self.assertAlmostEqual(p.gross_utility_plant() - p.accumulated_depreciation(),
                                p.net_utility_plant(), delta=0.01)
 
-    def test_new_nuclear_costs_nine_billion_and_is_not_predepreciated(self):
+    def test_new_nuclear_costs_eighteen_billion_and_is_not_predepreciated(self):
         p = utility.PlayerState()
-        self.assertEqual(p.construction_cost('nuclear'), 9_000_000_000)
-        self.assertEqual(utility.GUI_BUILD_INFO['nuclear'][1], 9_000_000_000)
-        p.cash = 12_000_000_000
+        self.assertEqual(p.construction_cost('nuclear'), 18_000_000_000)
+        self.assertEqual(utility.GUI_BUILD_INFO['nuclear'][1], 18_000_000_000)
+        p.cash = 21_000_000_000
         self.assertTrue(p.start_construction('nuclear'))
         self.assertEqual(p.cash, 3_000_000_000)
         self.assertEqual(p.ongoing_constructions[-1]['turns_remaining'], 72)
@@ -147,10 +147,10 @@ class CreditBalanceTests(unittest.TestCase):
         p.update_constructions()
         asset = p.plant_assets[-1]
         self.assertEqual(asset.plant_type, 'nuclear')
-        self.assertEqual(asset.original_cost, 9_000_000_000)
+        self.assertEqual(asset.original_cost, 18_000_000_000)
         self.assertEqual(asset.months_in_service, 0)
         self.assertEqual(asset.accumulated_depreciation, 0)
-        self.assertAlmostEqual(asset.monthly_depreciation, 9_000_000_000 / 720)
+        self.assertAlmostEqual(asset.monthly_depreciation, 18_000_000_000 / 720)
 
     def test_inherited_depreciation_is_not_charged_again_at_first_close(self):
         s = utility.UtilityGameSession()
